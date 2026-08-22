@@ -21,6 +21,11 @@ class _Tag {
   static const int jpegIfOffset = 513; // aka "OldJpegInterchangeFormat".
   static const int jpegIfByteCount = 514;
   static const int subIfds = 330;
+
+  /// `DNGVersion` — present in IFD0 if and only if the file conforms to the
+  /// DNG spec (a DNG is a constrained subset of TIFF). Used by
+  /// [isDngVersionTagPresent] to distinguish a DNG from a plain TIFF.
+  static const int dngVersion = 0xC612; // 50706
 }
 
 /// TIFF field types, per the TIFF 6.0 spec, and their on-disk byte size —
@@ -74,6 +79,57 @@ Uint8List? extractLargestDngPreviewJpeg(Uint8List dngBytes) {
     // Any parse error (truncated file, out-of-range offset, etc.) — no
     // preview available, not a crash.
     return null;
+  }
+}
+
+/// Returns whether [bytes] is TIFF-structured (`II*\0`/`MM\0*`) *and* its
+/// IFD0 contains the `DNGVersion` tag (0xC612) — the standard way to tell a
+/// DNG apart from a plain TIFF, per the DNG spec (DNGVersion is required and
+/// always lives in IFD0, never a SubIFD). Used by
+/// `lib/core/media_detector.dart`'s content-based classifier.
+///
+/// Deliberately much lighter than [extractLargestDngPreviewJpeg]: it only
+/// walks IFD0's entry table checking each entry's raw tag id, never
+/// resolving any entry's value or type, and never visits SubIFDs or the
+/// IFD chain — so it works correctly even when [bytes] is just a leading
+/// prefix of a much larger file, as long as that prefix reaches past IFD0's
+/// entry table (comfortably true for any real phone DNG within a small
+/// sniffed header). Never throws: any malformed/truncated input, or a file
+/// that isn't TIFF-structured at all, simply yields `false`.
+bool isDngVersionTagPresent(Uint8List bytes) {
+  try {
+    if (bytes.length < 8) return false;
+    final data = ByteData.sublistView(bytes);
+
+    final Endian endian;
+    if (bytes[0] == 0x49 && bytes[1] == 0x49) {
+      endian = Endian.little;
+    } else if (bytes[0] == 0x4D && bytes[1] == 0x4D) {
+      endian = Endian.big;
+    } else {
+      return false;
+    }
+    if (data.getUint16(2, endian) != 42) return false;
+
+    final ifd0Offset = data.getUint32(4, endian);
+    if (ifd0Offset <= 0 || ifd0Offset + 2 > bytes.length) return false;
+
+    final count = data.getUint16(ifd0Offset, endian);
+    final entriesStart = ifd0Offset + 2;
+    final entriesEnd = entriesStart + count * 12;
+    // If the available bytes don't reach the end of IFD0's entry table,
+    // there isn't enough here to be sure — report "not a DNG" rather than
+    // risk reading past the buffer. Real DNGs' IFD0 entry tables are a few
+    // hundred bytes at most, well within any reasonable sniffed prefix.
+    if (entriesEnd > bytes.length) return false;
+
+    for (var i = 0; i < count; i++) {
+      final entryOffset = entriesStart + i * 12;
+      if (data.getUint16(entryOffset, endian) == _Tag.dngVersion) return true;
+    }
+    return false;
+  } catch (_) {
+    return false;
   }
 }
 
