@@ -230,6 +230,7 @@ RawDecodeOutcome _decodeEncodedImageSync(Uint8List encodedBytes, RawDecodeSource
     width: width,
     height: height,
     bytes: bytes.buffer,
+    bytesOffset: bytes.offsetInBytes,
     numChannels: numChannels,
     order: numChannels == 4 ? img.ChannelOrder.rgba : img.ChannelOrder.rgb,
   );

@@ -88,20 +88,24 @@ class _PhotoScreenState extends State<PhotoScreen> {
         setState(() => _stage = _Stage.processing);
         final rawBytes = await File(rawPath).readAsBytes();
         final decoded = await decodeRawFile(rawBytes);
-        prepared = await preparePhotoFromRgba(
-          RawPrepareRequest(
-            rgbBytes: decoded.rgbBytes,
+        final results = await Future.wait([
+          preparePhotoFromRgba(
+            RawPrepareRequest(
+              rgbBytes: decoded.rgbBytes,
+              width: decoded.width,
+              height: decoded.height,
+              cubeText: cubeText,
+            ),
+          ),
+          encodePixelsAsJpeg(
+            bytes: decoded.rgbBytes,
             width: decoded.width,
             height: decoded.height,
-            cubeText: cubeText,
+            numChannels: 3,
           ),
-        );
-        displayBytes = await encodePixelsAsJpeg(
-          bytes: decoded.rgbBytes,
-          width: decoded.width,
-          height: decoded.height,
-          numChannels: 3,
-        );
+        ]);
+        prepared = results[0] as PreparedPhoto;
+        displayBytes = results[1] as Uint8List;
         if (!mounted) return;
         _rawSource = decoded.source;
       } else {

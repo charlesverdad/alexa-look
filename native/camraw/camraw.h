@@ -24,11 +24,10 @@ extern "C" {
 // LibRaw error code is returned (see LibRaw's LIBRAW_* enum /
 // LibRaw::strerror) and *out_rgb is left untouched (not written).
 //
-// Not reentrant-safe to call concurrently from multiple threads on
-// overlapping buffers is fine (each call is self-contained, no shared
-// state), but this library is built with LIBRAW_NOTHREADS, so avoid calling
-// camraw_decode concurrently from multiple threads at once — the Dart side
-// only ever calls it from a single Isolate.run at a time.
+// NOT thread-safe: this library is built with LIBRAW_NOTHREADS, so
+// camraw_decode must never run concurrently from multiple threads. Callers
+// must serialize decodes (the Dart side runs one Isolate.run decode at a
+// time).
 int32_t camraw_decode(const uint8_t* data, int32_t len, int32_t* out_w,
                        int32_t* out_h, uint8_t** out_rgb);
 

@@ -238,6 +238,7 @@ Future<PreparedPhoto> preparePhotoFromRgba(RawPrepareRequest request) {
       width: request.width,
       height: request.height,
       bytes: request.rgbBytes.buffer,
+      bytesOffset: request.rgbBytes.offsetInBytes,
       numChannels: request.numChannels,
       order: request.numChannels == 4
           ? img.ChannelOrder.rgba
@@ -326,6 +327,7 @@ Future<Uint8List> encodePixelsAsJpeg({
       width: width,
       height: height,
       bytes: bytes.buffer,
+      bytesOffset: bytes.offsetInBytes,
       numChannels: numChannels,
       order: numChannels == 4 ? img.ChannelOrder.rgba : img.ChannelOrder.rgb,
     );
