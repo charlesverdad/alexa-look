@@ -138,6 +138,52 @@ void main() {
       expect(result.category, MediaCategory.video);
     });
 
+    test('AVIF still image: ftyp brand avif is not routed to the mp4 video catch-all', () {
+      final bytes = _bytes(
+        [0, 0, 0, 0x1C, ..._ascii('ftyp'), ..._ascii('avif')],
+      );
+      final result = classifyMediaBytes(bytes);
+      // package:image 4.9.2 ships no AVIF decoder (see media_detector.dart's
+      // _unsupportedStillImageBrands doc comment), so this is reported as
+      // unsupported rather than silently routed to either the video
+      // pipeline or the (equally non-functional for AVIF) heic-labelled
+      // photo pipeline.
+      expect(result.format, MediaFormat.unknown);
+      expect(result.category, MediaCategory.unsupported);
+      expect(result.format, isNot(MediaFormat.mp4));
+      expect(result.format, isNot(MediaFormat.heic));
+      expect(result.byExtensionFallback, isFalse);
+    });
+
+    test('AVIF image sequence: ftyp brand avis is likewise not video', () {
+      final bytes = _bytes(
+        [0, 0, 0, 0x1C, ..._ascii('ftyp'), ..._ascii('avis')],
+      );
+      final result = classifyMediaBytes(bytes);
+      expect(result.category, isNot(MediaCategory.video));
+      expect(result.category, MediaCategory.unsupported);
+    });
+
+    test('HEIF generic multi-image-sequence ftyp brand msf1 is not routed to video', () {
+      final bytes = _bytes(
+        [0, 0, 0, 0x1C, ..._ascii('ftyp'), ..._ascii('msf1')],
+      );
+      final result = classifyMediaBytes(bytes);
+      expect(result.category, isNot(MediaCategory.video));
+      expect(result.category, MediaCategory.unsupported);
+    });
+
+    test('HEIF brand set gap: heim/heis/hevm/hevs are recognized as heic-like photo', () {
+      for (final brand in ['heim', 'heis', 'hevm', 'hevs']) {
+        final bytes = _bytes(
+          [0, 0, 0, 0x1C, ..._ascii('ftyp'), ..._ascii(brand)],
+        );
+        final result = classifyMediaBytes(bytes);
+        expect(result.format, MediaFormat.heic, reason: 'brand "$brand"');
+        expect(result.category, MediaCategory.photo, reason: 'brand "$brand"');
+      }
+    });
+
     test('big-endian ("MM") TIFF is recognized the same as little-endian', () {
       // Build a big-endian TIFF by hand: header only, no IFD0 entries (still
       // enough to be recognized as *a* TIFF and, since it can't find
@@ -151,6 +197,36 @@ void main() {
       data.setUint16(8, 0, Endian.big); // IFD0 with 0 entries.
       final result = classifyMediaBytes(bytes);
       expect(result.format, MediaFormat.tiff);
+    });
+
+    test("'II' prefix without the TIFF magic number 42 is not misclassified as TIFF", () {
+      // A valid 'II' TIFF byte-order prefix, but junk (not 42) at the magic
+      // number offset — e.g. two bytes that happen to collide with the
+      // signature but aren't actually a TIFF header.
+      final bytes = _bytes([0x49, 0x49, 0xAA, 0xBB, 0x00, 0x00, 0x00, 0x00]);
+      final result = classifyMediaBytes(bytes, path: '/tmp/mystery.dat');
+      expect(result.format, isNot(MediaFormat.tiff));
+      expect(result.format, isNot(MediaFormat.dng));
+      // Content sniffing correctly found this inconclusive, so the
+      // extension fallback (unrecognized ".dat") kicks in.
+      expect(result.byExtensionFallback, isTrue);
+      expect(result.format, MediaFormat.unknown);
+    });
+
+    test("'MM' prefix without the TIFF magic number 42 falls through to unknown", () {
+      final bytes = _bytes([0x4D, 0x4D, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+      final result = classifyMediaBytes(bytes);
+      expect(result.format, MediaFormat.unknown);
+      expect(result.category, MediaCategory.unsupported);
+    });
+
+    test("'II' + magic 42 but too short to read the magic number field is inconclusive, "
+        'not misclassified as TIFF', () {
+      // Only 3 bytes — 'II' plus one more — can't even fit the 2-byte magic
+      // number field at offset 2..4, so this must not be reported as TIFF.
+      final bytes = Uint8List.fromList([0x49, 0x49, 0x00]);
+      final result = classifyMediaBytes(bytes);
+      expect(result.format, isNot(MediaFormat.tiff));
     });
   });
 

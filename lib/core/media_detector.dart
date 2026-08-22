@@ -122,6 +122,29 @@ String? _fourCC(Uint8List bytes, int offset) {
 /// a QuickTime `.mov` container specifically, rather than a generic MP4.
 const Set<String> _quickTimeBrands = {'qt  '};
 
+/// AVIF (AV1 Image File Format) and generic HEIF "ftyp" brands that are
+/// still images/image-sequences, not video, despite sharing the exact same
+/// ISOBMFF "ftyp" box shape with MP4/MOV — without checking for them
+/// specifically, they'd fall into the "any other ftyp brand" catch-all
+/// below and get routed to the video pipeline, where ffmpeg would either
+/// mishandle them or fail confusingly.
+///
+///  - `avif`/`avis`: AVIF still image / image sequence.
+///  - `msf1`: the generic HEIF "multi-image sequence" brand, shared by both
+///    AVIF and HEIC sequence containers.
+///
+/// These are intentionally classified as [MediaFormat.unknown]
+/// (unsupported) rather than [MediaFormat.heic]: the app's photo pipeline
+/// decodes still images via `package:image` (see
+/// `lib/features/photo/photo_processor.dart`'s `img.decodeImage`), and
+/// `package:image` 4.9.2 ships no AVIF decoder — its
+/// `lib/src/formats/` directory has bmp/exr/gif/ico/jpeg/png/psd/pvr/
+/// tga/tiff/webp decoders and nothing AVIF-shaped. Routing an AVIF file to
+/// the (already HEIC-labelled, and equally non-functional for this
+/// decoder) photo pipeline would just fail there instead of here, with a
+/// less clear error. Revisit this once `package:image` adds AVIF support.
+const Set<String> _unsupportedStillImageBrands = {'avif', 'avis', 'msf1'};
+
 MediaFormat? _sniff(Uint8List b) {
   // JPEG: SOI marker FF D8 FF.
   if (b.length >= 3 && b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF) {
@@ -146,8 +169,15 @@ MediaFormat? _sniff(Uint8List b) {
   // — same box shape, distinguished by brand.
   if (b.length >= 12 && _fourCC(b, 4) == 'ftyp') {
     final brand = _fourCC(b, 8);
-    const heicBrands = {'heic', 'heix', 'hevc', 'hevx', 'mif1'};
+    // heim/heis/hevm/hevs (multiview/scalable HEIC variants) added
+    // alongside the original heic/heix/hevc/hevx/mif1 set — same still-image
+    // HEIF family, just brands a phone gallery can plausibly hand back that
+    // the original set didn't cover.
+    const heicBrands = {'heic', 'heix', 'hevc', 'hevx', 'heim', 'heis', 'hevm', 'hevs', 'mif1'};
     if (brand != null && heicBrands.contains(brand)) return MediaFormat.heic;
+    if (brand != null && _unsupportedStillImageBrands.contains(brand)) {
+      return MediaFormat.unknown;
+    }
     if (brand != null && _quickTimeBrands.contains(brand)) {
       return MediaFormat.quicktime;
     }
@@ -181,11 +211,24 @@ MediaFormat? _sniff(Uint8List b) {
     return MediaFormat.matroska;
   }
 
-  // TIFF-structured: 'II'/'MM' + magic 42. Could be a plain TIFF or a DNG
-  // (a constrained TIFF subset) — reuse the IFD0 walker in dng_preview.dart
-  // rather than a second parser to tell them apart.
+  // TIFF-structured: 'II'/'MM' + magic 42 (at offset 2, in the endianness
+  // the 'II'/'MM' prefix itself declares). The 2-byte prefix alone is a
+  // weak signal — plenty of non-TIFF content can start with "II" or "MM" by
+  // coincidence — so the magic-42 field must also check out before treating
+  // this as TIFF-structured at all, same as isDngVersionTagPresent does for
+  // the DNG-specific check below.
   if (b.length >= 4 &&
       ((b[0] == 0x49 && b[1] == 0x49) || (b[0] == 0x4D && b[1] == 0x4D))) {
+    final endian = (b[0] == 0x49 && b[1] == 0x49) ? Endian.little : Endian.big;
+    final magic = ByteData.sublistView(b).getUint16(2, endian);
+    if (magic != 42) {
+      // Not actually TIFF-structured — fall through to the caller's
+      // extension fallback instead of misreporting this as TIFF.
+      return null;
+    }
+    // Could be a plain TIFF or a DNG (a constrained TIFF subset) — reuse the
+    // IFD0 walker in dng_preview.dart rather than a second parser to tell
+    // them apart.
     return isDngVersionTagPresent(b) ? MediaFormat.dng : MediaFormat.tiff;
   }
 

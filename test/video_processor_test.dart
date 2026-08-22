@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:alexa_look/features/video/video_processor.dart';
@@ -322,6 +324,142 @@ void main() {
         'able to tell a cancellation apart from a genuine encode failure', () {
       const cancelled = VideoGradeCancelledException();
       expect(cancelled, isNot(isA<VideoGradeException>()));
+    });
+  });
+
+  group('VideoCancellationToken', () {
+    test('starts uncancelled, and cancel() is a one-way, idempotent flip', () {
+      final token = VideoCancellationToken();
+      expect(token.isCancelled, isFalse);
+      token.cancel();
+      expect(token.isCancelled, isTrue);
+      token.cancel(); // calling again must not throw or un-set anything.
+      expect(token.isCancelled, isTrue);
+    });
+  });
+
+  group('VideoGradeSession.cancel persists across the ladder (cancelRequested)', () {
+    test('cancelRequested is false until cancel() is called', () {
+      final session = VideoGradeSession(
+        currentSessionId: () => null,
+        cancellationToken: VideoCancellationToken(),
+        result: Completer<VideoGradeResult>().future,
+      );
+      expect(session.cancelRequested, isFalse);
+    });
+
+    test('cancel() sets cancelRequested even when no ffmpeg session id exists yet — '
+        'covers cancelling during ffprobe/startup, before any attempt has started', () {
+      final session = VideoGradeSession(
+        currentSessionId: () => null, // no attempt has started yet.
+        cancellationToken: VideoCancellationToken(),
+        result: Completer<VideoGradeResult>().future,
+      );
+      session.cancel();
+      expect(session.cancelRequested, isTrue);
+    });
+
+    test('cancelRequested stays true across what would be several ladder attempts — '
+        'the same token instance is shared by the whole session, not just one attempt', () {
+      // No live ffmpeg session id here (`currentSessionId: () => null`) so
+      // cancel() only exercises the token side, not a real
+      // FFmpegKit.cancel() call — that requires plugin bindings this plain
+      // unit test doesn't set up; the id != null path is a one-line
+      // pass-through already covered by manual review and by the real
+      // FFmpegKit integration the rest of the app relies on.
+      final token = VideoCancellationToken();
+      final session = VideoGradeSession(
+        currentSessionId: () => null,
+        cancellationToken: token,
+        result: Completer<VideoGradeResult>().future,
+      );
+      session.cancel();
+      expect(token.isCancelled, isTrue);
+      expect(session.cancelRequested, isTrue);
+      // A fresh session built from the *same* token (as gradeVideoToTempFile
+      // does when a caller passes its own cancellationToken across what
+      // amounts to the same logical grading run) sees the cancellation too.
+      final sameTokenSession = VideoGradeSession(
+        currentSessionId: () => null,
+        cancellationToken: token,
+        result: Completer<VideoGradeResult>().future,
+      );
+      expect(sameTokenSession.cancelRequested, isTrue);
+    });
+  });
+
+  group('attemptOutcomeIfAlreadyCancelled — the "before starting each ladder attempt" check', () {
+    test('returns null (proceed normally) when the token has not been cancelled', () {
+      expect(attemptOutcomeIfAlreadyCancelled(VideoCancellationToken()), isNull);
+    });
+
+    test('returns a cancelled outcome, without ever touching ffmpeg, once the token is '
+        'cancelled — covers cancelling during ffprobe/startup or in the gap between two '
+        'ladder attempts', () {
+      final token = VideoCancellationToken()..cancel();
+      final outcome = attemptOutcomeIfAlreadyCancelled(token);
+      expect(outcome, isNotNull);
+      expect(outcome!.cancelled, isTrue);
+      expect(outcome.success, isFalse);
+    });
+  });
+
+  group('resolveAttemptOutcome — the "after each attempt completes" check', () {
+    test('reports success when ffmpeg succeeded and no cancellation was requested', () {
+      final outcome = resolveAttemptOutcome(
+        token: VideoCancellationToken(),
+        ffmpegSuccess: true,
+        ffmpegCancelled: false,
+      );
+      expect(outcome.success, isTrue);
+    });
+
+    test('reports cancelled when ffmpeg itself reports a cancelled return code', () {
+      final outcome = resolveAttemptOutcome(
+        token: VideoCancellationToken(),
+        ffmpegSuccess: false,
+        ffmpegCancelled: true,
+      );
+      expect(outcome.cancelled, isTrue);
+    });
+
+    test('reports failure (preserving the log) for a genuine, non-cancelled failure', () {
+      final outcome = resolveAttemptOutcome(
+        token: VideoCancellationToken(),
+        ffmpegSuccess: false,
+        ffmpegCancelled: false,
+        failureLog: 'boom',
+      );
+      expect(outcome.success, isFalse);
+      expect(outcome.cancelled, isFalse);
+      expect(outcome.log, 'boom');
+    });
+
+    test('a cancelled token overrides a reported ffmpeg SUCCESS — the completion race this '
+        'app must not lose: an attempt finishing just as cancel() is called must never be '
+        'treated as a usable, savable result', () {
+      final token = VideoCancellationToken()..cancel();
+      final outcome = resolveAttemptOutcome(
+        token: token,
+        ffmpegSuccess: true,
+        ffmpegCancelled: false,
+      );
+      expect(outcome.success, isFalse);
+      expect(outcome.cancelled, isTrue);
+    });
+
+    test('a cancelled token overrides a reported ffmpeg FAILURE too — otherwise an attempt '
+        'that happened to fail naturally right as cancel() was requested would fall through '
+        'to the next fallback attempt instead of stopping the ladder', () {
+      final token = VideoCancellationToken()..cancel();
+      final outcome = resolveAttemptOutcome(
+        token: token,
+        ffmpegSuccess: false,
+        ffmpegCancelled: false,
+        failureLog: 'mediacodec unavailable',
+      );
+      expect(outcome.cancelled, isTrue);
+      expect(outcome.success, isFalse);
     });
   });
 }

@@ -41,6 +41,16 @@ class _BatchScreenState extends State<BatchScreen> {
   PreparedLut? _preparedLut;
   VideoGradeSession? _activeGradeSession;
 
+  /// Created synchronously at the top of [_processVideo], *before* any of
+  /// its awaits (the lut file, ffprobe, starting the first ffmpeg attempt)
+  /// — unlike [_activeGradeSession], which is only assigned once
+  /// `gradeVideoToTempFile` has returned. This closes the gap where
+  /// [dispose] runs while a video item is still starting up: without a
+  /// token that already exists, `_activeGradeSession?.cancel()` would be a
+  /// no-op (still null) and the encode would run to completion and get
+  /// saved regardless of the cancellation. See [VideoCancellationToken].
+  VideoCancellationToken? _activeCancellationToken;
+
   /// Populated as each item finishes saving, keyed by [BatchItem.id] —
   /// handed to the results screen once the run completes.
   final Map<String, ExportedItem> _exported = {};
@@ -69,6 +79,12 @@ class _BatchScreenState extends State<BatchScreen> {
     // "cancelled" outcome — see video_processor.dart — so the in-flight item
     // is marked cancelled rather than saved).
     _controller.cancel();
+    // Cancel the token first — it's set up before _activeGradeSession can
+    // exist (see its doc comment), so it's the one guaranteed to reach a
+    // video item that's still in ffprobe/startup. _activeGradeSession, when
+    // it exists, additionally stops whichever ffmpeg session is actively
+    // running right now rather than waiting for it to finish on its own.
+    _activeCancellationToken?.cancel();
     _activeGradeSession?.cancel();
     unawaited(WakelockPlus.disable());
     super.dispose();
@@ -147,15 +163,30 @@ class _BatchScreenState extends State<BatchScreen> {
     // pass (blend filter) that isn't worth the extra encode time in a batch
     // run, so — same as the single-video editor — videos are always graded
     // at full look strength regardless of the shared intensity slider.
-    final lutFile = await ensureAlexaLookLutFile();
-    final session = await gradeVideoToTempFile(
-      inputPath: item.path,
-      lutPath: lutFile.path,
-      onProgress: onProgress,
-    );
-    _activeGradeSession = session;
+    // Created before any await below (including the lut file and ffprobe)
+    // so a dispose() racing this startup window can still cancel it — see
+    // _activeCancellationToken's doc comment.
+    final token = VideoCancellationToken();
+    _activeCancellationToken = token;
     try {
+      final lutFile = await ensureAlexaLookLutFile();
+      final session = await gradeVideoToTempFile(
+        inputPath: item.path,
+        lutPath: lutFile.path,
+        onProgress: onProgress,
+        cancellationToken: token,
+      );
+      _activeGradeSession = session;
       final result = await session.result;
+      if (token.isCancelled) {
+        // Defensive last-mile check: gradeVideoToTempFile's own ladder
+        // already refuses to report success once cancelled (see
+        // resolveAttemptOutcome), but a cancellation racing the moment
+        // `result` resolves could otherwise slip through here — a
+        // cancelled outcome must never reach Gal.putVideo.
+        unawaited(deleteTempVideoBestEffort(result.path));
+        throw const VideoGradeCancelledException();
+      }
       await Gal.putVideo(result.path, album: kAlexaLookAlbum);
       // Unlike before, the temp mp4 is *not* deleted here — it's kept
       // around so the results screen can still offer Share while it's
@@ -168,6 +199,7 @@ class _BatchScreenState extends State<BatchScreen> {
       );
     } finally {
       _activeGradeSession = null;
+      _activeCancellationToken = null;
     }
   }
 

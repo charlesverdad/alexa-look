@@ -187,7 +187,12 @@ class _ResultTile extends StatelessWidget {
           fit: StackFit.expand,
           children: [
             if (item.kind == ExportedKind.photo && item.previewBytes != null)
-              Image.memory(item.previewBytes!, fit: BoxFit.cover)
+              // cacheWidth avoids decoding the full-resolution graded photo
+              // just to paint a small grid tile — same pattern as
+              // batch_screen.dart's grid. The full-res decode still happens
+              // for the tap-to-preview screen below (_PhotoPreview), where
+              // it's actually needed.
+              Image.memory(item.previewBytes!, fit: BoxFit.cover, cacheWidth: 240)
             else
               const Center(
                 child: Icon(Icons.play_circle_outline, color: AppTheme.textSecondary, size: 32),
