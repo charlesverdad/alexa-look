@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -7,6 +8,7 @@ import 'package:image_picker/image_picker.dart';
 
 import '../../core/lut_asset.dart';
 import '../../core/output_naming.dart';
+import '../../core/raw_import.dart';
 import '../../theme/app_theme.dart';
 import 'photo_processor.dart';
 
@@ -19,7 +21,13 @@ class PhotoScreen extends StatefulWidget {
   /// single-item editor.
   final XFile? initialFile;
 
-  const PhotoScreen({super.key, this.initialFile});
+  /// When provided, this is the path to a RAW/DNG file to decode (through
+  /// the fallback chain in `lib/core/raw_import.dart`) instead of opening
+  /// the picker or grading [initialFile] — used by the home screen's
+  /// "RAW" import action. Mutually exclusive with [initialFile].
+  final String? initialRawPath;
+
+  const PhotoScreen({super.key, this.initialFile, this.initialRawPath});
 
   @override
   State<PhotoScreen> createState() => _PhotoScreenState();
@@ -34,6 +42,12 @@ class _PhotoScreenState extends State<PhotoScreen> {
   bool _holdingOriginal = false;
   String? _errorMessage;
   String? _cubeText;
+
+  /// Set only when this photo came in via [PhotoScreen.initialRawPath] —
+  /// which decoder in the RAW fallback chain actually produced it, shown as
+  /// a small badge (see [_RawSourceBadge]) so the user knows how faithful
+  /// the result is.
+  RawDecodeSource? _rawSource;
 
   // Cached after the first prepare so that dragging the intensity slider
   // only re-runs the cheap LUT-apply + encode step on the small preview
@@ -53,35 +67,73 @@ class _PhotoScreenState extends State<PhotoScreen> {
   }
 
   Future<void> _pickAndProcess() async {
+    final rawPath = widget.initialRawPath;
     try {
       XFile? file = widget.initialFile;
-      if (file == null) {
+      if (rawPath == null && file == null) {
         final picker = ImagePicker();
         file = await picker.pickImage(source: ImageSource.gallery);
       }
-      if (file == null) {
+      if (rawPath == null && file == null) {
         if (mounted) Navigator.of(context).pop();
         return;
       }
-      final bytes = await file.readAsBytes();
+
       final cubeText = _cubeText ??= await loadAlexaLookLutText();
       if (!mounted) return;
-      setState(() {
-        _originalBytes = bytes;
-        _stage = _Stage.processing;
-      });
-      final prepared = await preparePhoto(
-        PhotoPrepareRequest(originalBytes: bytes, cubeText: cubeText),
-      );
+
+      PreparedPhoto prepared;
+      Uint8List displayBytes;
+      if (rawPath != null) {
+        setState(() => _stage = _Stage.processing);
+        final rawBytes = await File(rawPath).readAsBytes();
+        final decoded = await decodeRawFile(rawBytes);
+        final results = await Future.wait([
+          preparePhotoFromRgba(
+            RawPrepareRequest(
+              rgbBytes: decoded.rgbBytes,
+              width: decoded.width,
+              height: decoded.height,
+              cubeText: cubeText,
+            ),
+          ),
+          encodePixelsAsJpeg(
+            bytes: decoded.rgbBytes,
+            width: decoded.width,
+            height: decoded.height,
+            numChannels: 3,
+          ),
+        ]);
+        prepared = results[0] as PreparedPhoto;
+        displayBytes = results[1] as Uint8List;
+        if (!mounted) return;
+        _rawSource = decoded.source;
+      } else {
+        final bytes = await file!.readAsBytes();
+        setState(() {
+          _originalBytes = bytes;
+          _stage = _Stage.processing;
+        });
+        prepared = await preparePhoto(
+          PhotoPrepareRequest(originalBytes: bytes, cubeText: cubeText),
+        );
+        displayBytes = bytes;
+      }
+
       if (!mounted) return;
       _prepared = prepared;
-      setState(() => _stage = _Stage.ready);
+      setState(() {
+        _originalBytes = displayBytes;
+        _stage = _Stage.ready;
+      });
       unawaited(_requestPreviewGrade(_pendingIntensity));
     } catch (e) {
       if (!mounted) return;
       setState(() {
         _stage = _Stage.error;
-        _errorMessage = 'Could not load that photo: $e';
+        _errorMessage = rawPath != null
+            ? 'Could not decode that RAW file: $e'
+            : 'Could not load that photo: $e';
       });
     }
   }
@@ -209,6 +261,12 @@ class _PhotoScreenState extends State<PhotoScreen> {
                 Container(
                   color: Colors.black.withValues(alpha: 0.45),
                   child: const _CenteredProgress(label: 'Applying the full-quality look…'),
+                ),
+              if (_rawSource != null)
+                Positioned(
+                  top: 24,
+                  left: 24,
+                  child: _RawSourceBadge(source: _rawSource!),
                 ),
               Positioned(
                 top: 24,
@@ -367,6 +425,39 @@ class _BeforeAfterToggle extends StatelessWidget {
               color: Colors.white,
               fontWeight: FontWeight.w600,
             ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Small badge shown over a RAW-imported photo indicating which decoder in
+/// the fallback chain (see `lib/core/raw_import.dart`) produced it: a real
+/// LibRaw demosaic, or one of the two preview-quality fallbacks (ffmpeg's
+/// render, or an embedded-JPEG-preview extraction) — both shown with the
+/// same label, since either way it's a baked-in-camera preview rather than
+/// a from-sensor-data raw decode.
+class _RawSourceBadge extends StatelessWidget {
+  final RawDecodeSource source;
+  const _RawSourceBadge({required this.source});
+
+  @override
+  Widget build(BuildContext context) {
+    final label = source == RawDecodeSource.libraw
+        ? 'RAW · LibRaw'
+        : 'RAW · preview fallback';
+    return Material(
+      color: Colors.black.withValues(alpha: 0.55),
+      borderRadius: BorderRadius.circular(20),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        child: Text(
+          label,
+          style: const TextStyle(
+            color: Colors.white,
+            fontWeight: FontWeight.w600,
+            fontSize: 12,
           ),
         ),
       ),
