@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
 
+import 'core/licenses.dart';
 import 'features/home/home_screen.dart';
 import 'theme/app_theme.dart';
 
 void main() {
+  registerThirdPartyLicenses();
   runApp(const AlexaLookApp());
 }
 

@@ -8,6 +8,8 @@ generated entirely from published, generic camera color-science constants.
 
 - Pick a single photo or video, or select multiple items at once for a
   batch run.
+- Import a RAW/DNG photo (including a phone's Pro-mode/UltraRAW capture) and
+  grade it through the same pipeline — see "RAW (DNG) photo support" below.
 - The app applies a soft, desaturated, film-print-style grade: gentle shadow
   toe, healthy mid-tone contrast, and a soft highlight roll-off — not a heavy
   teal/orange grade.
@@ -116,6 +118,66 @@ stays saved even if you cancel or back out. Picking exactly one item routes
 into the same single-item editor as the dedicated Photo/Video flows, for the
 richer per-item editing experience.
 
+## RAW (DNG) photo support
+
+**Import RAW** on the home screen lets you grade an Adobe DNG raw photo —
+including a phone's Pro-mode/UltraRAW capture — through the same look
+pipeline as any other photo. Tested against the **Xiaomi 15 Ultra**'s
+Pro-mode RAW and UltraRAW DNGs, but works with standard DNG files from any
+source.
+
+### How it decodes a RAW file
+
+On Android, decoding tries three approaches in order, stopping at the first
+one that works (see [`lib/core/raw_import.dart`](lib/core/raw_import.dart)):
+
+1. **LibRaw**, via `dart:ffi` — a real from-sensor-data raw demosaic, using
+   the file's own embedded camera white balance and outputting sRGB. This is
+   the primary path and gives the most faithful result.
+2. **ffmpeg** (already bundled for video grading) renders a single frame of
+   the DNG to PNG. ffmpeg's own DNG decoder doesn't do the same
+   demosaic/white-balance work LibRaw does, so this can look flatter or
+   darker — a reasonable fallback, not a replacement.
+3. **Embedded JPEG preview extraction** — a small, dependency-free, pure-Dart
+   TIFF/IFD parser ([`lib/core/dng_preview.dart`](lib/core/dng_preview.dart))
+   that reads the DNG's own directory structure to find and extract the
+   largest JPEG preview the camera already baked into the file (via
+   `JpegIFOffset`/`JpegIFByteCount` or a single-strip JPEG-compressed IFD).
+
+On **iOS**, there is no native decoder — LibRaw isn't built for iOS — so the
+same fallback chain runs starting from step 2 (ffmpeg, then the embedded
+preview). The editor shows a small **"RAW · LibRaw"** or
+**"RAW · preview fallback"** badge so you always know which path produced
+what you're looking at. If every step fails (a corrupt file, or a raw
+variant with no recognizable structure), you get a clear error instead of a
+silent bad result.
+
+Whichever decoder ran, the result feeds into the exact same
+`preparePhoto`/grading pipeline as a normally-picked photo — downscaled to
+the same resolution cap, graded with the same LUT, saved to the same
+dedicated **Alexa Look** album as a JPEG with the same collision-free naming
+(see "Saving" above).
+
+### LibRaw attribution & license
+
+The primary Android decoder is built on a trimmed, vendored copy of
+[**LibRaw**](https://www.libraw.org/) **0.21.5**
+(`native/libraw/`, see
+[`native/libraw/VENDORING.md`](native/libraw/VENDORING.md) for exactly what's
+included and why), compiled into `libcamraw.so` alongside a small C++
+wrapper ([`native/camraw/`](native/camraw/)) via
+`android/app/build.gradle.kts`'s `externalNativeBuild` and
+[`native/CMakeLists.txt`](native/CMakeLists.txt), and loaded at runtime
+through hand-written `dart:ffi` bindings
+([`lib/core/raw_decoder.dart`](lib/core/raw_decoder.dart)) — no `ffigen`,
+just three bound functions.
+
+LibRaw is dual-licensed under the **LGPL-2.1** and the **CDDL-1.0**; both
+license texts and LibRaw's own copyright notice are included verbatim under
+`native/libraw/` (`LICENSE.LGPL`, `LICENSE.CDDL`, `COPYRIGHT`). This app
+loads LibRaw as a dynamically-linked shared library, which satisfies the
+LGPL's linking terms. No LibRaw source is modified from upstream.
+
 ## App icon
 
 The app icon is generated deterministically in pure Dart —
@@ -199,18 +261,44 @@ The suite covers:
   and cancellation taking effect between items.
 - A widget smoke test asserting the home screen renders its Photo and Video
   actions.
+- The RAW/DNG embedded-preview parser (`extractLargestDngPreviewJpeg`)
+  against hand-crafted TIFF/IFD byte structures: `JpegIFOffset` previews,
+  single-strip JPEG-compressed-IFD previews, SubIFD traversal, picking the
+  largest of several candidates, and graceful (non-throwing) handling of
+  malformed/truncated input.
+- The RAW decode fallback chain's control flow (`decodeRawFile`) with
+  injected fake decoders: falling through past a declining or throwing step,
+  chain order (an earlier success means later steps are never called), and
+  every step failing producing a clear error.
+- `RawDecoder`'s platform guard cleanly reporting the native LibRaw decoder
+  unavailable (never crashing) when not running on Android — which is what
+  every `flutter test` run exercises, since the suite runs on the host.
+
+Native code (the vendored LibRaw + `native/camraw/` wrapper, see the RAW
+section below) only compiles as part of an actual Android build — there's no
+NDK available for `flutter test`/`flutter analyze` to build against, so it's
+validated separately: every vendored `.cpp` file compiles cleanly with the
+project's exact defines using the host's own C++ toolchain, and the wrapper
+was additionally linked into a real `.so` and exercised end-to-end (version
+string, an invalid-input error path, and a full successful decode of a
+synthetic DNG) before this was merged.
 
 ## Project layout
 
 ```
 lib/
-  core/            Pure-Dart color science, .cube parser, LUT generation/apply, LUT asset loading, output naming
+  core/            Pure-Dart color science, .cube parser, LUT generation/apply, LUT asset loading,
+                   output naming, RAW decode (dart:ffi bindings, DNG preview parser, fallback chain)
   features/
-    home/          Home screen (Photo / Video / Batch entry points)
+    home/          Home screen (Photo / Video / Batch / RAW entry points)
     photo/         Photo picking, multicore grading, live preview, save
     video/         Video picking, ffmpeg-based grading, progress, save
     batch/         Multi-select batch flow: models, state-machine controller, grid UI
   theme/           App-wide dark theme, page transitions
+native/
+  CMakeLists.txt   Builds libcamraw.so (vendored LibRaw + the camraw wrapper) for Android
+  libraw/          Vendored, trimmed LibRaw source + license files — see VENDORING.md
+  camraw/          Thin extern "C" wrapper around LibRaw's C++ API
 tool/
   generate_lut.dart   Deterministic LUT generator (dart run tool/generate_lut.dart)
   generate_icon.dart  Deterministic app icon generator (dart run tool/generate_icon.dart)
