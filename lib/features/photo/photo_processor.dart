@@ -194,7 +194,64 @@ PreparedPhoto _preparePhotoSync(PhotoPrepareRequest request) {
   // downstream steps (like copyResize, below the size cap) also bake
   // orientation as a side effect, but only when they actually run — doing it
   // here up front guarantees every photo is corrected, not just large ones.
-  var image = img.bakeOrientation(decoded);
+  final image = img.bakeOrientation(decoded);
+
+  return _prepareFromImage(image, request.cubeText, request.buildPreview);
+}
+
+/// Input to [preparePhotoFromRgba]: an already-decoded RAW photo (see
+/// `lib/core/raw_import.dart`), as an interleaved RGB or RGBA buffer plus
+/// its dimensions.
+class RawPrepareRequest {
+  final Uint8List rgbBytes;
+  final int width;
+  final int height;
+
+  /// Number of channels in [rgbBytes] — 3 (RGB) for a fresh LibRaw/ffmpeg
+  /// decode, 4 (RGBA) if the caller already normalized it.
+  final int numChannels;
+  final String cubeText;
+  final bool buildPreview;
+
+  const RawPrepareRequest({
+    required this.rgbBytes,
+    required this.width,
+    required this.height,
+    required this.cubeText,
+    this.numChannels = 3,
+    this.buildPreview = true,
+  });
+}
+
+/// Like [preparePhoto], but for a RAW photo that's already been decoded to
+/// pixels (by LibRaw, ffmpeg, or the embedded-preview fallback — see
+/// `lib/core/raw_import.dart`) rather than an encoded JPEG/PNG/etc.
+///
+/// Skips [img.decodeImage] entirely — the caller's decoder already produced
+/// pixels — but otherwise applies the exact same size cap, preview
+/// downscale, and LUT parsing as [preparePhoto], so a RAW-sourced and a
+/// normally-picked photo end up as equally-shaped [PreparedPhoto]s. Also
+/// runs inside [Isolate.run].
+Future<PreparedPhoto> preparePhotoFromRgba(RawPrepareRequest request) {
+  return Isolate.run(() {
+    final image = img.Image.fromBytes(
+      width: request.width,
+      height: request.height,
+      bytes: request.rgbBytes.buffer,
+      numChannels: request.numChannels,
+      order: request.numChannels == 4
+          ? img.ChannelOrder.rgba
+          : img.ChannelOrder.rgb,
+    );
+    return _prepareFromImage(image, request.cubeText, request.buildPreview);
+  });
+}
+
+/// Shared post-decode work for both [preparePhoto] and
+/// [preparePhotoFromRgba]: cap to [kMaxFullResolutionDimension], normalize
+/// to 8-bit RGBA, build the preview copy, and parse the LUT.
+PreparedPhoto _prepareFromImage(img.Image decoded, String cubeText, bool buildPreview) {
+  var image = decoded;
 
   // Cap the working resolution to keep processing time and memory bounded
   // on typical phone photos while still producing a shareable result.
@@ -222,7 +279,7 @@ PreparedPhoto _preparePhotoSync(PhotoPrepareRequest request) {
   var previewRgbaBytes = Uint8List(0);
   var previewWidth = 0;
   var previewHeight = 0;
-  if (request.buildPreview) {
+  if (buildPreview) {
     img.Image previewImage = image;
     if (image.width > kMaxPreviewDimension || image.height > kMaxPreviewDimension) {
       previewImage = img.copyResize(
@@ -237,7 +294,7 @@ PreparedPhoto _preparePhotoSync(PhotoPrepareRequest request) {
     previewHeight = previewImage.height;
   }
 
-  final lut = CubeLut.parse(request.cubeText);
+  final lut = CubeLut.parse(cubeText);
 
   return PreparedPhoto(
     fullRgbaBytes: fullRgbaBytes,
@@ -251,6 +308,29 @@ PreparedPhoto _preparePhotoSync(PhotoPrepareRequest request) {
     lutDomainMin: lut.domainMin,
     lutDomainMax: lut.domainMax,
   );
+}
+
+/// Encodes an interleaved RGB or RGBA buffer as a JPEG, off the calling
+/// isolate. Used to turn a decoded RAW photo's pixels into displayable
+/// bytes for the "before" side of the photo editor's before/after toggle
+/// (a DNG's own file bytes aren't directly displayable by [Image.memory]).
+Future<Uint8List> encodePixelsAsJpeg({
+  required Uint8List bytes,
+  required int width,
+  required int height,
+  required int numChannels,
+  int quality = kFullSaveJpegQuality,
+}) {
+  return Isolate.run(() {
+    final image = img.Image.fromBytes(
+      width: width,
+      height: height,
+      bytes: bytes.buffer,
+      numChannels: numChannels,
+      order: numChannels == 4 ? img.ChannelOrder.rgba : img.ChannelOrder.rgb,
+    );
+    return Uint8List.fromList(img.encodeJpg(image, quality: quality));
+  });
 }
 
 /// Applies the LUT to [request.rgbaBytes] at [request.intensity], splitting
