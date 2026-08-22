@@ -73,6 +73,59 @@ class AppTheme {
       progressIndicatorTheme: const ProgressIndicatorThemeData(
         color: accent,
       ),
+      pageTransitionsTheme: const PageTransitionsTheme(
+        builders: {
+          TargetPlatform.android: _CinematicFadeTransitionsBuilder(),
+          TargetPlatform.iOS: _CinematicFadeTransitionsBuilder(),
+        },
+      ),
+    );
+  }
+
+  /// Pushes [page] with the app's smooth fade+scale transition, for screens
+  /// built outside a route that already picks up [dark]'s
+  /// `pageTransitionsTheme` (which only applies to [MaterialPageRoute]/
+  /// [PageRoute]s using the platform default builder — this helper is handy
+  /// for call sites that want the same feel explicitly).
+  static Route<T> route<T>(Widget page) {
+    return PageRouteBuilder<T>(
+      transitionDuration: const Duration(milliseconds: 260),
+      reverseTransitionDuration: const Duration(milliseconds: 200),
+      pageBuilder: (context, animation, secondaryAnimation) => page,
+      transitionsBuilder: (context, animation, secondaryAnimation, child) {
+        final curved = CurvedAnimation(parent: animation, curve: Curves.easeOutCubic);
+        return FadeTransition(
+          opacity: curved,
+          child: ScaleTransition(
+            scale: Tween(begin: 0.98, end: 1.0).animate(curved),
+            child: child,
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// A gentle, cinematic fade+scale page transition (no hard slide), used app-
+/// wide so navigating between screens feels smooth and unobtrusive.
+class _CinematicFadeTransitionsBuilder extends PageTransitionsBuilder {
+  const _CinematicFadeTransitionsBuilder();
+
+  @override
+  Widget buildTransitions<T>(
+    PageRoute<T> route,
+    BuildContext context,
+    Animation<double> animation,
+    Animation<double> secondaryAnimation,
+    Widget child,
+  ) {
+    final curved = CurvedAnimation(parent: animation, curve: Curves.easeOutCubic);
+    return FadeTransition(
+      opacity: curved,
+      child: ScaleTransition(
+        scale: Tween(begin: 0.98, end: 1.0).animate(curved),
+        child: child,
+      ),
     );
   }
 }
