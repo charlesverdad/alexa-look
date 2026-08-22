@@ -20,6 +20,7 @@ import 'package:path_provider/path_provider.dart';
 
 import '../features/photo/photo_processor.dart' show kMaxFullResolutionDimension;
 import 'dng_preview.dart';
+import 'image_cap.dart';
 import 'output_naming.dart';
 import 'raw_decoder.dart';
 
@@ -217,16 +218,16 @@ RawDecodeOutcome _decodeEncodedImageSync(Uint8List encodedBytes, RawDecodeSource
 }
 
 /// Wraps [bytes] as an [img.Image], caps it to [kMaxFullResolutionDimension]
-/// if larger, and returns its pixels back out as a plain RGB buffer —
-/// releasing the (possibly much larger, e.g. ~150MB for a 50MP raw) input
-/// buffer as soon as this returns.
+/// if larger (via [capToMaxDimension]), and returns its pixels back out as a
+/// plain RGB buffer — releasing the (possibly much larger, e.g. ~150MB for a
+/// 50MP raw) input buffer as soon as this returns.
 ({Uint8List bytes, int width, int height}) _capToRgb(
   Uint8List bytes,
   int width,
   int height, {
   required int numChannels,
 }) {
-  var image = img.Image.fromBytes(
+  final source = img.Image.fromBytes(
     width: width,
     height: height,
     bytes: bytes.buffer,
@@ -234,15 +235,16 @@ RawDecodeOutcome _decodeEncodedImageSync(Uint8List encodedBytes, RawDecodeSource
     numChannels: numChannels,
     order: numChannels == 4 ? img.ChannelOrder.rgba : img.ChannelOrder.rgb,
   );
-  if (image.width > kMaxFullResolutionDimension || image.height > kMaxFullResolutionDimension) {
-    image = img.copyResize(
-      image,
-      width: image.width >= image.height ? kMaxFullResolutionDimension : null,
-      height: image.height > image.width ? kMaxFullResolutionDimension : null,
-      interpolation: img.Interpolation.average,
-    );
-  }
-  final rgb = image.convert(format: img.Format.uint8, numChannels: 3);
+  final capped = capToMaxDimension(source, kMaxFullResolutionDimension);
+  // Every caller of this function (LibRaw's decode, ffmpeg's rendered PNG,
+  // the embedded JPEG preview) already normalizes its result to 8-bit RGB
+  // before handing bytes here, so skip the conversion pass entirely when
+  // there's nothing left to normalize — otherwise this would silently
+  // re-copy/re-convert the whole image a second time, for no reason, on
+  // every RAW import.
+  final rgb = capped.format == img.Format.uint8 && capped.numChannels == 3
+      ? capped
+      : capped.convert(format: img.Format.uint8, numChannels: 3);
   return (
     bytes: rgb.getBytes(order: img.ChannelOrder.rgb),
     width: rgb.width,

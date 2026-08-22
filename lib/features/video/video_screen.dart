@@ -1,6 +1,5 @@
 import 'dart:async';
 
-import 'package:ffmpeg_kit_flutter_new_full/ffmpeg_kit.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:gal/gal.dart';
@@ -31,7 +30,8 @@ class _VideoScreenState extends State<VideoScreen> {
   double _progress = 0;
   String? _errorMessage;
   String? _outputPath;
-  int? _ffmpegSessionId;
+  VideoEncoder? _encoderUsed;
+  VideoGradeSession? _gradeSession;
 
   @override
   void initState() {
@@ -41,10 +41,7 @@ class _VideoScreenState extends State<VideoScreen> {
 
   @override
   void dispose() {
-    final id = _ffmpegSessionId;
-    if (id != null) {
-      FFmpegKit.cancel(id);
-    }
+    _gradeSession?.cancel();
     super.dispose();
   }
 
@@ -86,15 +83,21 @@ class _VideoScreenState extends State<VideoScreen> {
           setState(() => _progress = fraction);
         },
       );
-      _ffmpegSessionId = session.sessionId;
+      _gradeSession = session;
 
-      final outputPath = await session.outputPath;
+      final result = await session.result;
       if (!mounted) return;
       setState(() {
         _stage = _Stage.done;
-        _outputPath = outputPath;
+        _outputPath = result.path;
+        _encoderUsed = result.encoder;
         _progress = 1;
       });
+    } on VideoGradeCancelledException {
+      // The user backed out of this screen while grading was in flight (see
+      // dispose()), which cancelled the in-flight ffmpeg attempt. Stop
+      // silently — there's nothing to save and, since the widget is already
+      // unmounted by the time this resolves, nothing to show either.
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -113,8 +116,15 @@ class _VideoScreenState extends State<VideoScreen> {
       didSave = true;
       if (!mounted) return;
       HapticFeedback.mediumImpact();
+      final encoderLabel = _encoderUsed?.label;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Saved to $kAlexaLookAlbum album')),
+        SnackBar(
+          content: Text(
+            encoderLabel == null
+                ? 'Saved to $kAlexaLookAlbum album'
+                : 'Saved to $kAlexaLookAlbum album · $encoderLabel',
+          ),
+        ),
       );
     } catch (e) {
       if (!mounted) return;

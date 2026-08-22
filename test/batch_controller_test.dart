@@ -1,10 +1,21 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:image_picker/image_picker.dart';
 
+import 'package:alexa_look/core/cancellation.dart';
 import 'package:alexa_look/features/batch/batch_controller.dart';
 import 'package:alexa_look/features/batch/batch_models.dart';
 
 BatchItem _item(String path) => BatchItem.fromFile(XFile(path), id: path);
+
+/// A fake stand-in for [VideoGradeCancelledException] (video_processor.dart
+/// isn't imported here to keep this a pure BatchController unit test) —
+/// exercises the same `CancelledException` marker contract the real one
+/// implements.
+class _FakeCancelledException implements CancelledException {
+  const _FakeCancelledException();
+  @override
+  String toString() => 'cancelled';
+}
 
 void main() {
   group('BatchController', () {
@@ -116,6 +127,64 @@ void main() {
       expect(processed, ['a.jpg', 'b.jpg', 'c.jpg']);
       expect(items.every((i) => i.status == BatchItemStatus.done), isTrue);
       expect(controller.isComplete, isTrue);
+    });
+
+    test('a CancelledException marks the item cancelled, not failed, and does not stop '
+        'the rest of the batch', () async {
+      final items = [_item('a.mp4'), _item('b.mp4'), _item('c.jpg')];
+      final controller = BatchController(
+        items: items,
+        processPhoto: (item, intensity, onProgress) async => onProgress(1.0),
+        processVideo: (item, intensity, onProgress) async {
+          if (item.id == 'a.mp4') {
+            throw const _FakeCancelledException();
+          }
+          onProgress(1.0);
+        },
+      );
+
+      await controller.run(1.0);
+
+      expect(items[0].status, BatchItemStatus.cancelled);
+      expect(items[0].error, isNull);
+      expect(items[1].status, BatchItemStatus.done);
+      expect(items[2].status, BatchItemStatus.done);
+      expect(controller.doneCount, 2);
+      expect(controller.failedCount, 0);
+      expect(controller.cancelledCount, 1);
+      // A cancelled item is terminal, same as done/failed — it must not
+      // block isComplete or leave the batch looking stuck.
+      expect(controller.isComplete, isTrue);
+    });
+
+    test('calling cancel() while a video is mid-encode stops the batch: combined with '
+        'the caller also cancelling the in-flight ffmpeg session (see BatchScreen.dispose), '
+        'the item that was interrupted ends up cancelled and nothing further runs', () async {
+      final items = [_item('a.mp4'), _item('b.mp4')];
+      late BatchController controller;
+      final started = <String>[];
+      controller = BatchController(
+        items: items,
+        processPhoto: (item, intensity, onProgress) async {},
+        processVideo: (item, intensity, onProgress) async {
+          started.add(item.id);
+          // Simulate BatchScreen.dispose(): the widget is torn down mid
+          // encode, which calls both controller.cancel() (stop before the
+          // next item) and the active VideoGradeSession's cancel() (stop
+          // the current one) — the latter is what makes the video
+          // processor's own future resolve with a CancelledException.
+          controller.cancel();
+          throw const _FakeCancelledException();
+        },
+      );
+
+      await controller.run(1.0);
+
+      expect(started, ['a.mp4']);
+      expect(items[0].status, BatchItemStatus.cancelled);
+      // cancel() took effect before the next item started.
+      expect(items[1].status, BatchItemStatus.queued);
+      expect(controller.isRunning, isFalse);
     });
 
     test('a second concurrent run() call is a no-op while one is in flight', () async {

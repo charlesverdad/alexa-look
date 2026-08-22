@@ -22,7 +22,12 @@ BatchMediaType classifyMediaType(XFile file) {
 }
 
 /// Where a single [BatchItem] is in the batch pipeline.
-enum BatchItemStatus { queued, processing, done, failed }
+///
+/// [cancelled] is terminal like [done]/[failed], but distinct from both: it
+/// means processing was stopped by the user (e.g. backing out of the batch
+/// screen mid-encode) rather than finishing successfully or erroring out —
+/// nothing was saved for that item, and it isn't a failure to report.
+enum BatchItemStatus { queued, processing, done, failed, cancelled }
 
 /// One item in a batch run: a picked file, its classified media type, and
 /// its current pipeline status/progress/error.

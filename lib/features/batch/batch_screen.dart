@@ -1,6 +1,5 @@
 import 'dart:io';
 
-import 'package:ffmpeg_kit_flutter_new_full/ffmpeg_kit.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:gal/gal.dart';
@@ -30,8 +29,8 @@ class BatchScreen extends StatefulWidget {
 class _BatchScreenState extends State<BatchScreen> {
   late final BatchController _controller;
   double _intensity = 1.0;
-  String? _cubeText;
-  int? _activeFfmpegSessionId;
+  PreparedLut? _preparedLut;
+  VideoGradeSession? _activeGradeSession;
 
   @override
   void initState() {
@@ -49,12 +48,14 @@ class _BatchScreenState extends State<BatchScreen> {
   @override
   void dispose() {
     _controller.removeListener(_onControllerChanged);
-    final sessionId = _activeFfmpegSessionId;
-    if (sessionId != null) {
-      // Best-effort: cancel any in-flight encode if the user backs out of
-      // the batch screen entirely while a video is processing.
-      FFmpegKit.cancel(sessionId);
-    }
+    // Stop the batch run entirely if the user backs out of the batch screen:
+    // tell the controller not to start any further queued items, and
+    // best-effort cancel whichever ffmpeg encode is currently in flight (its
+    // cancellation propagates out through the video processor as a distinct
+    // "cancelled" outcome — see video_processor.dart — so the in-flight item
+    // is marked cancelled rather than saved).
+    _controller.cancel();
+    _activeGradeSession?.cancel();
     super.dispose();
   }
 
@@ -63,14 +64,17 @@ class _BatchScreenState extends State<BatchScreen> {
     double intensity,
     BatchProgressCallback onProgress,
   ) async {
-    final cubeText = _cubeText ??= await loadAlexaLookLutText();
+    // Parse the `.cube` LUT once for the whole batch and reuse the parsed
+    // lattice for every item — CubeLut.parse is wasted work to repeat per
+    // photo when every item shares the same look.
+    final preparedLut = _preparedLut ??= PreparedLut.parse(await loadAlexaLookLutText());
     onProgress(0.05);
     final bytes = await item.file.readAsBytes();
     onProgress(0.15);
     final prepared = await preparePhoto(
       PhotoPrepareRequest(
         originalBytes: bytes,
-        cubeText: cubeText,
+        preparedLut: preparedLut,
         // Batch only ever grades the full-resolution buffer — there's no
         // live slider preview here — so skip building the ~1200px preview
         // copy nobody looks at.
@@ -106,11 +110,14 @@ class _BatchScreenState extends State<BatchScreen> {
       lutPath: lutFile.path,
       onProgress: onProgress,
     );
-    _activeFfmpegSessionId = session.sessionId;
-    final outputPath = await session.outputPath;
-    _activeFfmpegSessionId = null;
-    await Gal.putVideo(outputPath, album: kAlexaLookAlbum);
-    await deleteTempVideoBestEffort(outputPath);
+    _activeGradeSession = session;
+    try {
+      final result = await session.result;
+      await Gal.putVideo(result.path, album: kAlexaLookAlbum);
+      await deleteTempVideoBestEffort(result.path);
+    } finally {
+      _activeGradeSession = null;
+    }
   }
 
   Future<void> _run() async {
@@ -127,10 +134,12 @@ class _BatchScreenState extends State<BatchScreen> {
         ),
       );
     } else {
+      final cancelledSuffix =
+          _controller.cancelledCount == 0 ? '' : ', ${_controller.cancelledCount} cancelled';
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            '${_controller.doneCount} saved, ${_controller.failedCount} failed. '
+            '${_controller.doneCount} saved, ${_controller.failedCount} failed$cancelledSuffix. '
             'Tap a failed item to see why.',
           ),
         ),
@@ -350,6 +359,13 @@ class _StatusOverlay extends StatelessWidget {
             child: const Center(
               child: Icon(Icons.error_outline, color: Colors.redAccent, size: 26),
             ),
+          ),
+        );
+      case BatchItemStatus.cancelled:
+        return Container(
+          color: Colors.black.withValues(alpha: 0.45),
+          child: const Center(
+            child: Icon(Icons.cancel_outlined, color: AppTheme.textSecondary, size: 26),
           ),
         );
     }

@@ -104,6 +104,33 @@ At runtime:
   videos are always graded at full strength, same as the single-video
   editor).
 
+### Video encoding: hardware H.264 first, compatibility fallback
+
+`lib/features/video/video_processor.dart` tries an ordered ladder of ffmpeg
+encode commands per video and keeps the first one that succeeds:
+
+1. **Hardware H.264** (`h264_mediacodec`, via the device's MediaCodec) at
+   the source's own resolution and bit rate — the bundled
+   `ffmpeg-kit-full` build has `--enable-mediacodec`/`--enable-jni`, and this
+   plays back on virtually every modern phone's gallery/media player.
+   MediaCodec availability can only be confirmed on-device, so this is
+   always tried first; if it fails, ffmpeg is retried automatically.
+2. **MPEG-4 compatibility fallback** (`-c:v mpeg4 -q:v 3`), scaled down to a
+   max dimension of 1280px. This is the previous default codec — MPEG-4
+   Part 2 (ASP) hardware decode support on modern phones is unreliable at
+   full resolution, which is why a phone-recorded 1080p/4K clip graded with
+   the old unconditional `mpeg4` pipeline could produce an mp4 the phone's
+   own gallery app couldn't play. Downscaling keeps this fallback playable
+   broadly.
+
+Each of those is additionally tried with `-c:a copy` (fast, lossless) before
+falling back to `-c:a aac -b:a 192k` if the source audio can't be
+stream-copied into an mp4 container. Every attempt sets `-pix_fmt yuv420p`
+explicitly (a modern phone's 10-bit HEVC/HDR source would otherwise carry an
+incompatible pixel format into the output) and `-movflags +faststart`. The
+save confirmation shows which encoder actually produced the file (e.g. "H.264
+(hardware)" vs "MPEG-4 (compatibility)").
+
 ## Batch mode
 
 Selecting more than one item from **Batch** on the home screen (via
@@ -202,6 +229,21 @@ icon resources under `android/app/src/main/res/` and
 build doesn't need to run either step — only do so after changing the icon
 art in `tool/generate_icon.dart`.
 
+## Sample results
+
+Real before/after output from the look, run on real free-license photos and
+a free-license video clip through the app's actual processing code (not
+mockups) — see [`docs/SAMPLES.md`](docs/SAMPLES.md) for the full set (four
+photos plus a video, each with source + license) and how they were produced.
+
+<table>
+<tr><th>Before</th><th>After</th></tr>
+<tr>
+<td><img src="docs/samples/01_portrait_before.jpg" width="420"></td>
+<td><img src="docs/samples/01_portrait_after.jpg" width="420"></td>
+</tr>
+</table>
+
 ## Trademark notice
 
 **"ARRI"** and **"ALEXA"** are trademarks of Arnold & Richter Cine Technik
@@ -273,6 +315,14 @@ The suite covers:
 - `RawDecoder`'s platform guard cleanly reporting the native LibRaw decoder
   unavailable (never crashing) when not running on Android — which is what
   every `flutter test` run exercises, since the suite runs on the host.
+- The video encode command ladder (`buildVideoEncodeAttempts`): attempt
+  ordering (hardware H.264 before the mpeg4 fallback, audio-copy before the
+  AAC re-encode variant), the compatibility scale computation (max-dimension
+  clamp, aspect preserved, even dimensions, never upscaling), the hardware
+  bitrate choice, and `lut3d`/path escaping — plus the retry ladder itself
+  (`runVideoEncodeLadder`) with injected fake attempt runners: falling
+  through a failing attempt to the next, and every attempt failing
+  surfacing the last one's ffmpeg log.
 
 Native code (the vendored LibRaw + `native/camraw/` wrapper, see the RAW
 section below) only compiles as part of an actual Android build — there's no
@@ -302,7 +352,11 @@ native/
 tool/
   generate_lut.dart   Deterministic LUT generator (dart run tool/generate_lut.dart)
   generate_icon.dart  Deterministic app icon generator (dart run tool/generate_icon.dart)
+  apply_look.dart     Pure-Dart CLI that grades one photo through the app's real
+                      pipeline (dart run tool/apply_look.dart <in> <out> [intensity]),
+                      used to produce docs/SAMPLES.md's before/after images
 assets/luts/       The generated, committed .cube LUT
 assets/icon/       The generated, committed app icon source PNGs
+docs/samples/      Before/after sample photos + video for docs/SAMPLES.md
 test/              Unit + widget tests
 ```

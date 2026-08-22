@@ -7,6 +7,7 @@ import 'package:image/image.dart' as img;
 
 import '../../core/alexa_look.dart' show Color3;
 import '../../core/cube_lut.dart';
+import '../../core/image_cap.dart';
 
 /// The largest dimension (in pixels) a photo is decoded/graded at for its
 /// full-resolution result. Keeps processing time and memory bounded on
@@ -31,12 +32,54 @@ const int kPreviewJpegQuality = 85;
 int gradingIsolateCount() =>
     (Platform.numberOfProcessors - 1).clamp(2, 8);
 
-/// Input to [preparePhoto]: the raw picked bytes plus the `.cube` LUT text
-/// to parse alongside them, bundled into one object so it can be sent across
-/// the isolate boundary in a single message.
+/// A `.cube` LUT already parsed and flattened into the shape
+/// [PreparedPhoto] carries, ready to hand to [PhotoPrepareRequest] without
+/// re-parsing the same `.cube` text on every call.
+///
+/// Parsing a `.cube` file is cheap once, but a caller that prepares many
+/// photos against one shared look — the batch flow — would otherwise redo
+/// it inside the prepare isolate for every single item. Parse once up
+/// front via [PreparedLut.parse] and reuse the result across every
+/// [preparePhoto]/[preparePhotoFromRgba] call instead.
+class PreparedLut {
+  final Float32List lattice;
+  final int size;
+  final Color3 domainMin;
+  final Color3 domainMax;
+
+  const PreparedLut({
+    required this.lattice,
+    required this.size,
+    required this.domainMin,
+    required this.domainMax,
+  });
+
+  /// Parses [cubeText] into a [PreparedLut].
+  factory PreparedLut.parse(String cubeText) {
+    final lut = CubeLut.parse(cubeText);
+    return PreparedLut(
+      lattice: lut.toFloat32Lattice(),
+      size: lut.size,
+      domainMin: lut.domainMin,
+      domainMax: lut.domainMax,
+    );
+  }
+}
+
+/// Input to [preparePhoto]: the raw picked bytes plus the `.cube` LUT to
+/// grade with, bundled into one object so it can be sent across the isolate
+/// boundary in a single message.
+///
+/// Exactly one of [cubeText] or [preparedLut] must be supplied. Passing
+/// [cubeText] parses it fresh, inside the prepare isolate — fine for the
+/// single-photo editor's one-shot prepare. A caller preparing many photos
+/// against the same look (the batch flow) should parse once via
+/// [PreparedLut.parse] and pass [preparedLut] instead, so the same lattice
+/// is reused rather than re-parsed per item.
 class PhotoPrepareRequest {
   final Uint8List originalBytes;
-  final String cubeText;
+  final String? cubeText;
+  final PreparedLut? preparedLut;
 
   /// Whether to build the small [kMaxPreviewDimension] preview copy used
   /// for the live intensity-slider preview. The single-photo editor needs
@@ -48,9 +91,13 @@ class PhotoPrepareRequest {
 
   const PhotoPrepareRequest({
     required this.originalBytes,
-    required this.cubeText,
+    this.cubeText,
+    this.preparedLut,
     this.buildPreview = true,
-  });
+  }) : assert(
+          (cubeText == null) != (preparedLut == null),
+          'Provide exactly one of cubeText or preparedLut.',
+        );
 }
 
 /// The expensive, intensity-independent work done once per picked photo:
@@ -174,9 +221,10 @@ class PhotoGradeResult {
   });
 }
 
-/// Decodes [request.originalBytes] and parses [request.cubeText], doing all
-/// of the work that only needs to happen once per picked photo regardless of
-/// how many times it gets regraded at different intensities.
+/// Decodes [request.originalBytes] and resolves its LUT (parsing
+/// [request.cubeText], or reusing [request.preparedLut] if already parsed),
+/// doing all of the work that only needs to happen once per picked photo
+/// regardless of how many times it gets regraded at different intensities.
 ///
 /// Runs in a background isolate via [Isolate.run] so the UI thread never
 /// blocks on it.
@@ -196,7 +244,8 @@ PreparedPhoto _preparePhotoSync(PhotoPrepareRequest request) {
   // here up front guarantees every photo is corrected, not just large ones.
   final image = img.bakeOrientation(decoded);
 
-  return _prepareFromImage(image, request.cubeText, request.buildPreview);
+  final lut = request.preparedLut ?? PreparedLut.parse(request.cubeText!);
+  return _prepareFromImage(image, lut, request.buildPreview);
 }
 
 /// Input to [preparePhotoFromRgba]: an already-decoded RAW photo (see
@@ -244,32 +293,30 @@ Future<PreparedPhoto> preparePhotoFromRgba(RawPrepareRequest request) {
           ? img.ChannelOrder.rgba
           : img.ChannelOrder.rgb,
     );
-    return _prepareFromImage(image, request.cubeText, request.buildPreview);
+    final lut = PreparedLut.parse(request.cubeText);
+    return _prepareFromImage(image, lut, request.buildPreview);
   });
 }
 
 /// Shared post-decode work for both [preparePhoto] and
-/// [preparePhotoFromRgba]: cap to [kMaxFullResolutionDimension], normalize
-/// to 8-bit RGBA, build the preview copy, and parse the LUT.
-PreparedPhoto _prepareFromImage(img.Image decoded, String cubeText, bool buildPreview) {
-  var image = decoded;
-
+/// [preparePhotoFromRgba]: cap to [kMaxFullResolutionDimension] (via
+/// [capToMaxDimension]), normalize to 8-bit RGBA, build the preview copy,
+/// and attach the (already-resolved) LUT.
+PreparedPhoto _prepareFromImage(img.Image decoded, PreparedLut lut, bool buildPreview) {
   // Cap the working resolution to keep processing time and memory bounded
-  // on typical phone photos while still producing a shareable result.
-  if (image.width > kMaxFullResolutionDimension ||
-      image.height > kMaxFullResolutionDimension) {
-    image = img.copyResize(
-      image,
-      width: image.width >= image.height ? kMaxFullResolutionDimension : null,
-      height: image.height > image.width ? kMaxFullResolutionDimension : null,
-      interpolation: img.Interpolation.average,
-    );
-  }
+  // on typical phone photos while still producing a shareable result. A
+  // RAW-sourced image (see `lib/core/raw_import.dart`) has typically already
+  // been capped to this same limit by its decode step — capToMaxDimension
+  // returns it unchanged in that case, so this never pays for a redundant
+  // resize.
+  var image = capToMaxDimension(decoded, kMaxFullResolutionDimension);
 
   // Normalize to 8-bit-per-channel RGBA before pulling out raw bytes.
   // Without this, higher-bit-depth sources (e.g. 16-bit PNG/TIFF) hand back
   // raw uint16 sample bytes from getBytes, which the LUT applier would
-  // misinterpret as 8-bit RGBA and corrupt.
+  // misinterpret as 8-bit RGBA and corrupt. Every source still needs this
+  // once — even a RAW-sourced RGB buffer — since it always needs the alpha
+  // channel added.
   image = image.convert(format: img.Format.uint8, numChannels: 4);
 
   final fullRgbaBytes = image.getBytes(order: img.ChannelOrder.rgba);
@@ -281,21 +328,11 @@ PreparedPhoto _prepareFromImage(img.Image decoded, String cubeText, bool buildPr
   var previewWidth = 0;
   var previewHeight = 0;
   if (buildPreview) {
-    img.Image previewImage = image;
-    if (image.width > kMaxPreviewDimension || image.height > kMaxPreviewDimension) {
-      previewImage = img.copyResize(
-        image,
-        width: image.width >= image.height ? kMaxPreviewDimension : null,
-        height: image.height > image.width ? kMaxPreviewDimension : null,
-        interpolation: img.Interpolation.average,
-      );
-    }
+    final previewImage = capToMaxDimension(image, kMaxPreviewDimension);
     previewRgbaBytes = previewImage.getBytes(order: img.ChannelOrder.rgba);
     previewWidth = previewImage.width;
     previewHeight = previewImage.height;
   }
-
-  final lut = CubeLut.parse(cubeText);
 
   return PreparedPhoto(
     fullRgbaBytes: fullRgbaBytes,
@@ -304,7 +341,7 @@ PreparedPhoto _prepareFromImage(img.Image decoded, String cubeText, bool buildPr
     previewRgbaBytes: previewRgbaBytes,
     previewWidth: previewWidth,
     previewHeight: previewHeight,
-    lutLattice: lut.toFloat32Lattice(),
+    lutLattice: lut.lattice,
     lutSize: lut.size,
     lutDomainMin: lut.domainMin,
     lutDomainMax: lut.domainMax,
