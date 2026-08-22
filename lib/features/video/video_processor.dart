@@ -11,6 +11,7 @@ import 'package:ffmpeg_kit_flutter_new_full/return_code.dart';
 import 'package:ffmpeg_kit_flutter_new_full/statistics.dart';
 import 'package:path_provider/path_provider.dart';
 
+import '../../core/cancellation.dart';
 import '../../core/output_naming.dart';
 
 /// Thrown when every ffmpeg encode attempt fails to grade a video.
@@ -20,6 +21,18 @@ class VideoGradeException implements Exception {
 
   @override
   String toString() => message;
+}
+
+/// Thrown when [VideoGradeSession.cancel] stopped the in-flight ffmpeg
+/// attempt before it finished. Distinct from [VideoGradeException]
+/// (a genuine encode failure) so callers can tell the two apart: a
+/// cancellation should stop silently — no error UI, nothing saved — while a
+/// real failure should be surfaced. See [CancelledException].
+class VideoGradeCancelledException implements CancelledException {
+  const VideoGradeCancelledException();
+
+  @override
+  String toString() => 'Video grading was cancelled.';
 }
 
 /// Which video encoder actually produced a graded output. Surfaced in the UI
@@ -79,13 +92,27 @@ class VideoEncodeAttempt {
 class VideoAttemptOutcome {
   final bool success;
 
+  /// True when the attempt was stopped by [VideoGradeSession.cancel] (an
+  /// ffmpeg return code of [ReturnCode.isCancel]) rather than failing on its
+  /// own — mutually exclusive with [success]. A cancelled attempt aborts the
+  /// whole ladder (see [runVideoEncodeLadder]) instead of falling through to
+  /// the next fallback encode.
+  final bool cancelled;
+
   /// ffmpeg's log output, populated on failure for diagnostics.
   final String? log;
 
   const VideoAttemptOutcome.success()
       : success = true,
+        cancelled = false,
         log = null;
-  const VideoAttemptOutcome.failure(this.log) : success = false;
+  const VideoAttemptOutcome.failure(this.log)
+      : success = false,
+        cancelled = false;
+  const VideoAttemptOutcome.cancelled()
+      : success = false,
+        cancelled = true,
+        log = null;
 }
 
 /// The live session backing an in-flight [gradeVideoToTempFile] call. Since
@@ -247,11 +274,16 @@ List<VideoEncodeAttempt> buildVideoEncodeAttempts({
 
 /// Runs [attempts] in order via [runAttempt], returning the encoder of the
 /// first one that succeeds. If every attempt fails, throws a
-/// [VideoGradeException] carrying the last attempt's log output.
+/// [VideoGradeException] carrying the last attempt's log output. If an
+/// attempt comes back [VideoAttemptOutcome.cancelled], the ladder stops
+/// immediately — it does *not* fall through to the next fallback encode —
+/// and throws [VideoGradeCancelledException] instead: a user-cancelled
+/// attempt isn't a failure to recover from, it's a request to stop.
 ///
 /// This is the test seam for the retry ladder: production code
 /// ([gradeVideoToTempFile]) passes a runner backed by real ffmpeg sessions;
-/// tests pass a fake that succeeds/fails by index without touching ffmpeg.
+/// tests pass a fake that succeeds/fails/cancels by index without touching
+/// ffmpeg.
 Future<VideoEncoder> runVideoEncodeLadder(
   List<VideoEncodeAttempt> attempts,
   Future<VideoAttemptOutcome> Function(VideoEncodeAttempt attempt) runAttempt,
@@ -261,6 +293,7 @@ Future<VideoEncoder> runVideoEncodeLadder(
   for (final attempt in attempts) {
     final outcome = await runAttempt(attempt);
     if (outcome.success) return attempt.encoder;
+    if (outcome.cancelled) throw const VideoGradeCancelledException();
     lastLog = outcome.log;
     lastDescription = attempt.description;
   }
@@ -341,6 +374,13 @@ Future<VideoGradeSession> gradeVideoToTempFile({
         final returnCode = await completedSession.getReturnCode();
         if (ReturnCode.isSuccess(returnCode)) {
           outcomeCompleter.complete(const VideoAttemptOutcome.success());
+        } else if (ReturnCode.isCancel(returnCode)) {
+          // FFmpegKit.cancel() (via VideoGradeSession.cancel) makes the
+          // session return this code — it is not a failure, and must not be
+          // treated like one: runVideoEncodeLadder aborts the whole ladder
+          // on a cancelled outcome instead of falling through to the next
+          // fallback encode.
+          outcomeCompleter.complete(const VideoAttemptOutcome.cancelled());
         } else {
           final logs = await completedSession.getOutput();
           outcomeCompleter.complete(
@@ -370,6 +410,13 @@ Future<VideoGradeSession> gradeVideoToTempFile({
     try {
       final encoder = await runVideoEncodeLadder(attempts, runAttempt);
       resultCompleter.complete(VideoGradeResult(path: outputPath, encoder: encoder));
+    } on VideoGradeCancelledException catch (e) {
+      // Whichever attempt was cancelled may have already written a partial
+      // output file before ffmpeg tore it down — clean it up so it doesn't
+      // linger in the temp dir (and, crucially, so nothing downstream can
+      // mistake it for a finished, savable result).
+      unawaited(deleteTempVideoBestEffort(outputPath));
+      resultCompleter.completeError(e);
     } catch (e) {
       resultCompleter.completeError(e is VideoGradeException ? e : VideoGradeException('$e'));
     } finally {

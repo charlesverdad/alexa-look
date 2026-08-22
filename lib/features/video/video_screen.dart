@@ -93,6 +93,11 @@ class _VideoScreenState extends State<VideoScreen> {
         _encoderUsed = result.encoder;
         _progress = 1;
       });
+    } on VideoGradeCancelledException {
+      // The user backed out of this screen while grading was in flight (see
+      // dispose()), which cancelled the in-flight ffmpeg attempt. Stop
+      // silently — there's nothing to save and, since the widget is already
+      // unmounted by the time this resolves, nothing to show either.
     } catch (e) {
       if (!mounted) return;
       setState(() {

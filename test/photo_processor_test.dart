@@ -171,6 +171,63 @@ void main() {
       expect(p.b, closeTo(50, 8));
     });
 
+    test('a cached PreparedLut (parsed once, reused across items — as the batch flow '
+        'does) produces byte-identical output to re-parsing cubeText per call', () async {
+      final source = img.Image(width: 3, height: 3);
+      source.setPixelRgb(0, 0, 200, 50, 50);
+      source.setPixelRgb(1, 0, 50, 200, 50);
+      source.setPixelRgb(2, 0, 50, 50, 200);
+      source.setPixelRgb(0, 1, 10, 10, 10);
+      source.setPixelRgb(1, 1, 240, 240, 240);
+      source.setPixelRgb(2, 1, 90, 130, 60);
+      source.setPixelRgb(0, 2, 5, 200, 220);
+      source.setPixelRgb(1, 2, 128, 128, 128);
+      source.setPixelRgb(2, 2, 255, 0, 255);
+      final pngBytes = Uint8List.fromList(img.encodePng(source));
+      final cubeText = _identityCube(3);
+
+      final fromText = await preparePhoto(
+        PhotoPrepareRequest(originalBytes: pngBytes, cubeText: cubeText),
+      );
+      final preparedLut = PreparedLut.parse(cubeText);
+      final fromCachedLut = await preparePhoto(
+        PhotoPrepareRequest(originalBytes: pngBytes, preparedLut: preparedLut),
+      );
+
+      // Same decoded/capped pixels either way.
+      expect(fromCachedLut.fullWidth, fromText.fullWidth);
+      expect(fromCachedLut.fullHeight, fromText.fullHeight);
+      expect(fromCachedLut.fullRgbaBytes, equals(fromText.fullRgbaBytes));
+
+      // Same resolved LUT lattice either way.
+      expect(fromCachedLut.lutSize, fromText.lutSize);
+      expect(fromCachedLut.lutLattice, equals(fromText.lutLattice));
+      expect(fromCachedLut.lutDomainMin.r, fromText.lutDomainMin.r);
+      expect(fromCachedLut.lutDomainMax.r, fromText.lutDomainMax.r);
+
+      // Grading from either PreparedPhoto produces identical bytes.
+      final gradedFromText = await gradeCachedPhoto(PhotoRegradeRequest.full(fromText, 1.0));
+      final gradedFromCached =
+          await gradeCachedPhoto(PhotoRegradeRequest.full(fromCachedLut, 1.0));
+      expect(gradedFromCached.gradedBytes, equals(gradedFromText.gradedBytes));
+    });
+
+    test('PhotoPrepareRequest requires exactly one of cubeText or preparedLut', () {
+      final lut = PreparedLut.parse(_identityCube(2));
+      expect(
+        () => PhotoPrepareRequest(originalBytes: Uint8List(0)),
+        throwsA(isA<AssertionError>()),
+      );
+      expect(
+        () => PhotoPrepareRequest(
+          originalBytes: Uint8List(0),
+          cubeText: _identityCube(2),
+          preparedLut: lut,
+        ),
+        throwsA(isA<AssertionError>()),
+      );
+    });
+
     test('preview target grades the small preview buffer', () async {
       final source = img.Image(width: 4, height: 4);
       for (var y = 0; y < 4; y++) {

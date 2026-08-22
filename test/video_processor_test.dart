@@ -264,4 +264,64 @@ void main() {
       expect(VideoEncoder.hardwareH264.label, isNot(VideoEncoder.compatMpeg4.label));
     });
   });
+
+  group('runVideoEncodeLadder cancellation', () {
+    VideoEncodeAttempt attempt(VideoEncoder encoder, String desc) => VideoEncodeAttempt(
+          encoder: encoder,
+          command: 'irrelevant',
+          description: desc,
+        );
+
+    test('a cancelled outcome aborts the ladder immediately: no further attempts run, '
+        'and a distinct VideoGradeCancelledException is thrown (not VideoGradeException)', () async {
+      final attempts = [
+        attempt(VideoEncoder.hardwareH264, 'first'),
+        attempt(VideoEncoder.hardwareH264, 'second'),
+        attempt(VideoEncoder.compatMpeg4, 'third'),
+      ];
+      final tried = <String>[];
+      Future<VideoEncoder> run() => runVideoEncodeLadder(attempts, (a) async {
+            tried.add(a.description);
+            if (a.description == 'first') {
+              return const VideoAttemptOutcome.cancelled();
+            }
+            // Should never be reached: the ladder must stop at the first
+            // cancelled outcome rather than falling through to a fallback
+            // encode.
+            return const VideoAttemptOutcome.success();
+          });
+
+      await expectLater(run, throwsA(isA<VideoGradeCancelledException>()));
+      expect(tried, ['first']);
+    });
+
+    test('a cancellation midway through the ladder still stops it, even after earlier '
+        'failures', () async {
+      final attempts = [
+        attempt(VideoEncoder.hardwareH264, 'a'),
+        attempt(VideoEncoder.hardwareH264, 'b'),
+        attempt(VideoEncoder.compatMpeg4, 'c'),
+      ];
+      final tried = <String>[];
+      Future<VideoEncoder> run() => runVideoEncodeLadder(attempts, (a) async {
+            tried.add(a.description);
+            if (a.description == 'a') {
+              return const VideoAttemptOutcome.failure('mediacodec unavailable');
+            }
+            if (a.description == 'b') {
+              return const VideoAttemptOutcome.cancelled();
+            }
+            return const VideoAttemptOutcome.success();
+          });
+
+      await expectLater(run, throwsA(isA<VideoGradeCancelledException>()));
+      expect(tried, ['a', 'b']);
+    });
+
+    test('VideoGradeCancelledException is not a VideoGradeException — callers must be '
+        'able to tell a cancellation apart from a genuine encode failure', () {
+      const cancelled = VideoGradeCancelledException();
+      expect(cancelled, isNot(isA<VideoGradeException>()));
+    });
+  });
 }
