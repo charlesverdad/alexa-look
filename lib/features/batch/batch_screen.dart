@@ -1,6 +1,5 @@
 import 'dart:io';
 
-import 'package:ffmpeg_kit_flutter_new_full/ffmpeg_kit.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:gal/gal.dart';
@@ -31,7 +30,7 @@ class _BatchScreenState extends State<BatchScreen> {
   late final BatchController _controller;
   double _intensity = 1.0;
   String? _cubeText;
-  int? _activeFfmpegSessionId;
+  VideoGradeSession? _activeGradeSession;
 
   @override
   void initState() {
@@ -49,12 +48,9 @@ class _BatchScreenState extends State<BatchScreen> {
   @override
   void dispose() {
     _controller.removeListener(_onControllerChanged);
-    final sessionId = _activeFfmpegSessionId;
-    if (sessionId != null) {
-      // Best-effort: cancel any in-flight encode if the user backs out of
-      // the batch screen entirely while a video is processing.
-      FFmpegKit.cancel(sessionId);
-    }
+    // Best-effort: cancel any in-flight encode if the user backs out of
+    // the batch screen entirely while a video is processing.
+    _activeGradeSession?.cancel();
     super.dispose();
   }
 
@@ -106,11 +102,11 @@ class _BatchScreenState extends State<BatchScreen> {
       lutPath: lutFile.path,
       onProgress: onProgress,
     );
-    _activeFfmpegSessionId = session.sessionId;
-    final outputPath = await session.outputPath;
-    _activeFfmpegSessionId = null;
-    await Gal.putVideo(outputPath, album: kAlexaLookAlbum);
-    await deleteTempVideoBestEffort(outputPath);
+    _activeGradeSession = session;
+    final result = await session.result;
+    _activeGradeSession = null;
+    await Gal.putVideo(result.path, album: kAlexaLookAlbum);
+    await deleteTempVideoBestEffort(result.path);
   }
 
   Future<void> _run() async {
