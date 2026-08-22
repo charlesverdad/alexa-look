@@ -229,6 +229,21 @@ icon resources under `android/app/src/main/res/` and
 build doesn't need to run either step — only do so after changing the icon
 art in `tool/generate_icon.dart`.
 
+## Sample results
+
+Real before/after output from the look, run on real free-license photos and
+a free-license video clip through the app's actual processing code (not
+mockups) — see [`docs/SAMPLES.md`](docs/SAMPLES.md) for the full set (four
+photos plus a video, each with source + license) and how they were produced.
+
+<table>
+<tr><th>Before</th><th>After</th></tr>
+<tr>
+<td><img src="docs/samples/01_portrait_before.jpg" width="420"></td>
+<td><img src="docs/samples/01_portrait_after.jpg" width="420"></td>
+</tr>
+</table>
+
 ## Trademark notice
 
 **"ARRI"** and **"ALEXA"** are trademarks of Arnold & Richter Cine Technik
@@ -337,7 +352,11 @@ native/
 tool/
   generate_lut.dart   Deterministic LUT generator (dart run tool/generate_lut.dart)
   generate_icon.dart  Deterministic app icon generator (dart run tool/generate_icon.dart)
+  apply_look.dart     Pure-Dart CLI that grades one photo through the app's real
+                      pipeline (dart run tool/apply_look.dart <in> <out> [intensity]),
+                      used to produce docs/SAMPLES.md's before/after images
 assets/luts/       The generated, committed .cube LUT
 assets/icon/       The generated, committed app icon source PNGs
+docs/samples/      Before/after sample photos + video for docs/SAMPLES.md
 test/              Unit + widget tests
 ```
