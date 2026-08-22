@@ -6,12 +6,54 @@ generated entirely from published, generic camera color-science constants.
 
 ## What it does
 
-- Pick a photo or video from your library.
+- Pick a single photo or video, or select multiple items at once for a
+  batch run.
 - The app applies a soft, desaturated, film-print-style grade: gentle shadow
   toe, healthy mid-tone contrast, and a soft highlight roll-off — not a heavy
   teal/orange grade.
-- Adjust the strength of the effect with an intensity slider (photos), toggle
-  a before/after preview, and save the result back to your gallery.
+- Adjust the strength of the effect with a **live-updating** intensity
+  slider (photos), press-and-hold (or the Before/After toggle) to compare,
+  and save the result — never overwriting your originals.
+
+## Saving: dedicated album, never overwrite
+
+Every graded photo and video is saved into its own **"Alexa Look"** gallery
+album — never mixed into your camera roll's default album, and never written
+over an existing file. Each output gets a unique, collision-free name of the
+form `alexa_look_<yyyyMMdd_HHmmss>_<uuid-suffix>` (see
+[`lib/core/output_naming.dart`](lib/core/output_naming.dart)), so even many
+photos saved in the same batch run within the same second never clash. Your
+original photo/video file is **never modified or deleted** — the app only
+ever reads it and writes a brand-new file elsewhere.
+
+## Performance: multicore photo grading
+
+Photo grading is parallelized across CPU cores:
+
+- The image is split into horizontal row bands — one per
+  `(Platform.numberOfProcessors - 1).clamp(2, 8)` — and each band is graded
+  concurrently in its own isolate via `Isolate.run`, then reassembled
+  ([`lib/features/photo/photo_processor.dart`](lib/features/photo/photo_processor.dart),
+  `gradeRgbaMulticore`). The LUT lattice is sent to each isolate as a flat,
+  compact `Float32List` (`CubeLut.toFloat32Lattice()`) rather than
+  re-parsing the `.cube` text per band.
+- The trilinear-interpolation inner loop
+  (`CubeLut.applyLutToRgbaBand`) is written as a single tight pass over the
+  pixel buffer with precomputed per-channel scale factors, no `Color3`
+  allocation, and no per-pixel function calls — the interpolation math is
+  inlined directly.
+- A small (max ~1200px) downscaled **preview copy** is kept alongside the
+  full-resolution image; dragging the intensity slider re-grades only that
+  preview (throttled to one in-flight regrade at a time, latest value
+  wins), so the slider feels effectively instant. The expensive
+  full-resolution grade only runs once, right before saving.
+- Photos are saved as JPEG (quality 95) instead of PNG — phone photos have
+  no alpha to preserve, and JPEG encodes noticeably faster and smaller.
+
+**Video** grading is ffmpeg-bound, not app-bound: `ffmpeg`'s `lut3d` filter
+already saturates the codec, so the app passes `-threads 0` to let ffmpeg
+use every available core for the encode itself; there's no per-frame Dart
+work to parallelize the way there is for photos.
 
 ## How the look is derived — and what it is *not*
 
@@ -48,11 +90,55 @@ produced it.
 At runtime:
 
 - **Photos** are graded in-process: [`lib/core/cube_lut.dart`](lib/core/cube_lut.dart)
-  parses the `.cube` file and applies it with trilinear interpolation, in a
-  background isolate, blended against the original by the intensity slider.
+  parses the `.cube` file and applies it with trilinear interpolation,
+  parallelized across background isolates (see "Performance" above), blended
+  against the original by the intensity slider.
 - **Videos** are graded with `ffmpeg`'s `lut3d` filter (via
   `ffmpeg_kit_flutter_new_full`, the LGPL build — no GPL codecs), pointed at
-  a copy of the same `.cube` file in the app's documents directory.
+  a copy of the same `.cube` file in the app's documents directory. Note:
+  ffmpeg's `lut3d` filter bakes the look at full strength — video doesn't
+  support the intensity slider's continuous blend the way photos do (in
+  batch mode, the shared intensity slider therefore only affects photos;
+  videos are always graded at full strength, same as the single-video
+  editor).
+
+## Batch mode
+
+Selecting more than one item from **Batch** on the home screen (via
+`image_picker`'s `pickMultipleMedia()`) opens a grid of thumbnails with
+per-item status (queued / processing with progress / done / failed) and one
+shared intensity slider. Tapping **"Apply look & save all"** processes
+everything in order — photos through the multicore pipeline, videos
+sequentially through ffmpeg — saving each into the Alexa Look album as it
+finishes. The run is cancellable between items (the item in flight is
+allowed to finish, so nothing is left half-saved); anything already saved
+stays saved even if you cancel or back out. Picking exactly one item routes
+into the same single-item editor as the dedicated Photo/Video flows, for the
+richer per-item editing experience.
+
+## App icon
+
+The app icon is generated deterministically in pure Dart —
+[`tool/generate_icon.dart`](tool/generate_icon.dart) uses only `package:image`
+(no design tool, no external assets) to render a 1024×1024 charcoal panel
+with a centered three-bar amber→warm-white→teal "waveform" motif and a
+subtle vignette, plus an Android adaptive-icon foreground/background pair.
+Running it twice produces byte-identical PNGs (enforced by
+`test/generate_icon_test.dart`, and CI regenerates and diffs the committed
+files the same way it does for the LUT).
+
+To regenerate the source PNGs and re-run icon generation for both platforms:
+
+```bash
+dart run tool/generate_icon.dart      # writes assets/icon/*.png
+dart run flutter_launcher_icons       # regenerates android/ and ios/ icon resources
+```
+
+Both the generated `assets/icon/*.png` sources and the platform-specific
+icon resources under `android/app/src/main/res/` and
+`ios/Runner/Assets.xcassets/AppIcon.appiconset/` are committed, so a normal
+build doesn't need to run either step — only do so after changing the icon
+art in `tool/generate_icon.dart`.
 
 ## Trademark notice
 
@@ -94,7 +180,23 @@ The suite covers:
   behavior, the mid-gray target range, and output range clamping.
 - The `.cube` parser (valid and malformed input) and trilinear interpolation
   (identity LUT round-trip, sane off-lattice sampling).
+- The optimized bulk trilinear path (`CubeLut.applyLutToRgbaBand`) matching
+  `CubeLut.apply` within 1 LSB across random pixels for a real, non-identity
+  LUT.
+- Multicore banded grading (`gradeRgbaMulticore`) producing byte-for-byte
+  identical output to a single-pass grade, including an odd image height
+  that doesn't divide evenly across isolates.
+- A performance sanity bound: the bulk trilinear path grades a 1000×1000
+  image well within a generous time budget, to catch pathological
+  regressions (e.g. an accidental per-pixel allocation).
 - Deterministic LUT generation (two runs produce identical bytes).
+- Deterministic icon generation (two runs of each PNG variant produce
+  identical bytes).
+- Unique output-name generation: no collisions across thousands of names
+  generated at the same instant.
+- `BatchController`'s pure state-machine logic: queued → processing → done
+  transitions, failure isolation (one failed item doesn't stop the rest),
+  and cancellation taking effect between items.
 - A widget smoke test asserting the home screen renders its Photo and Video
   actions.
 
@@ -102,14 +204,17 @@ The suite covers:
 
 ```
 lib/
-  core/            Pure-Dart color science, .cube parser, LUT generation, LUT asset loading
+  core/            Pure-Dart color science, .cube parser, LUT generation/apply, LUT asset loading, output naming
   features/
-    home/          Home screen (Photo / Video entry points)
-    photo/         Photo picking, grading (background isolate), preview, save
+    home/          Home screen (Photo / Video / Batch entry points)
+    photo/         Photo picking, multicore grading, live preview, save
     video/         Video picking, ffmpeg-based grading, progress, save
-  theme/           App-wide dark theme
+    batch/         Multi-select batch flow: models, state-machine controller, grid UI
+  theme/           App-wide dark theme, page transitions
 tool/
-  generate_lut.dart  Deterministic LUT generator (dart run tool/generate_lut.dart)
+  generate_lut.dart   Deterministic LUT generator (dart run tool/generate_lut.dart)
+  generate_icon.dart  Deterministic app icon generator (dart run tool/generate_icon.dart)
 assets/luts/       The generated, committed .cube LUT
+assets/icon/       The generated, committed app icon source PNGs
 test/              Unit + widget tests
 ```
