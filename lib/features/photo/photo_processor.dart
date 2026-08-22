@@ -1,9 +1,35 @@
+import 'dart:io';
 import 'dart:isolate';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:image/image.dart' as img;
 
+import '../../core/alexa_look.dart' show Color3;
 import '../../core/cube_lut.dart';
+
+/// The largest dimension (in pixels) a photo is decoded/graded at for its
+/// full-resolution result. Keeps processing time and memory bounded on
+/// typical phone photos while still producing a shareable result.
+const int kMaxFullResolutionDimension = 3000;
+
+/// The largest dimension a live-preview copy is downscaled to. Small enough
+/// that re-grading it on every slider tick feels effectively instant, large
+/// enough to look sharp full-screen on a phone.
+const int kMaxPreviewDimension = 1200;
+
+/// JPEG quality used for the final, full-resolution save. Phone photos have
+/// no alpha to preserve, and JPEG encodes much faster and smaller than PNG.
+const int kFullSaveJpegQuality = 95;
+
+/// JPEG quality used for the live preview re-encode — a little lower, since
+/// it is redrawn on every slider tick and only ever shown on-screen.
+const int kPreviewJpegQuality = 85;
+
+/// Number of isolates to fan a single grade out across: one per extra core
+/// (reserving one for the UI/platform thread), clamped to a sane range.
+int gradingIsolateCount() =>
+    (Platform.numberOfProcessors - 1).clamp(2, 8);
 
 /// Input to [preparePhoto]: the raw picked bytes plus the `.cube` LUT text
 /// to parse alongside them, bundled into one object so it can be sent across
@@ -19,52 +45,105 @@ class PhotoPrepareRequest {
 }
 
 /// The expensive, intensity-independent work done once per picked photo:
-/// decoding, orientation baking, downsizing, and LUT parsing.
+/// decoding, orientation baking, downsizing (both full-res and a small
+/// preview copy), and LUT parsing.
 ///
-/// Callers should hold onto this and reuse it across every [gradeCachedPhoto]
-/// call for the same photo (e.g. as the user drags the intensity slider),
-/// instead of redoing decode/resize/parse on every regrade.
+/// Callers should hold onto this and reuse it across every regrade call for
+/// the same photo (e.g. as the user drags the intensity slider), instead of
+/// redoing decode/resize/parse every time.
 class PreparedPhoto {
-  /// Decoded, orientation-baked, resized image, as interleaved uint8 RGBA
-  /// bytes — never mutated in place, so it stays valid as a source for
-  /// repeated grading.
-  final Uint8List rgbaBytes;
-  final int width;
-  final int height;
-  final CubeLut lut;
+  /// Full-resolution decoded, orientation-baked, resized image, as
+  /// interleaved uint8 RGBA bytes — never mutated in place, so it stays
+  /// valid as a source for repeated grading. Used only when saving.
+  final Uint8List fullRgbaBytes;
+  final int fullWidth;
+  final int fullHeight;
+
+  /// A small downscaled copy of the same image (max
+  /// [kMaxPreviewDimension] on its longest side), used for the live
+  /// intensity-slider preview so re-grading feels instant.
+  final Uint8List previewRgbaBytes;
+  final int previewWidth;
+  final int previewHeight;
+
+  /// The LUT lattice, flattened once so every regrade (preview or full) can
+  /// reuse it across isolate boundaries without re-parsing the `.cube` text.
+  final Float32List lutLattice;
+  final int lutSize;
+  final Color3 lutDomainMin;
+  final Color3 lutDomainMax;
 
   const PreparedPhoto({
-    required this.rgbaBytes,
-    required this.width,
-    required this.height,
-    required this.lut,
+    required this.fullRgbaBytes,
+    required this.fullWidth,
+    required this.fullHeight,
+    required this.previewRgbaBytes,
+    required this.previewWidth,
+    required this.previewHeight,
+    required this.lutLattice,
+    required this.lutSize,
+    required this.lutDomainMin,
+    required this.lutDomainMax,
   });
 }
 
-/// Input to [gradeCachedPhoto]: a previously [preparePhoto]d photo plus the
-/// intensity to grade it at.
+/// Which of a [PreparedPhoto]'s two buffers to grade.
+enum PhotoGradeTarget { preview, full }
+
+/// Input to [gradeCachedPhoto]: a previously [preparePhoto]d photo, the
+/// intensity to grade it at, and which resolution to grade.
 class PhotoRegradeRequest {
   final Uint8List rgbaBytes;
   final int width;
   final int height;
-  final CubeLut lut;
+  final Float32List lutLattice;
+  final int lutSize;
+  final Color3 lutDomainMin;
+  final Color3 lutDomainMax;
   final double intensity;
+  final PhotoGradeTarget target;
 
   const PhotoRegradeRequest({
     required this.rgbaBytes,
     required this.width,
     required this.height,
-    required this.lut,
+    required this.lutLattice,
+    required this.lutSize,
+    required this.lutDomainMin,
+    required this.lutDomainMax,
     required this.intensity,
+    required this.target,
   });
 
-  factory PhotoRegradeRequest.from(PreparedPhoto prepared, double intensity) {
+  /// Grades the small preview copy — cheap enough to call on every slider
+  /// tick.
+  factory PhotoRegradeRequest.preview(PreparedPhoto prepared, double intensity) {
     return PhotoRegradeRequest(
-      rgbaBytes: prepared.rgbaBytes,
-      width: prepared.width,
-      height: prepared.height,
-      lut: prepared.lut,
+      rgbaBytes: prepared.previewRgbaBytes,
+      width: prepared.previewWidth,
+      height: prepared.previewHeight,
+      lutLattice: prepared.lutLattice,
+      lutSize: prepared.lutSize,
+      lutDomainMin: prepared.lutDomainMin,
+      lutDomainMax: prepared.lutDomainMax,
       intensity: intensity,
+      target: PhotoGradeTarget.preview,
+    );
+  }
+
+  /// Grades the full-resolution copy — only needed once, right before
+  /// saving.
+  factory PhotoRegradeRequest.full(PreparedPhoto prepared, double intensity) {
+    return PhotoRegradeRequest(
+      rgbaBytes: prepared.fullRgbaBytes,
+      width: prepared.fullWidth,
+      height: prepared.fullHeight,
+      lutLattice: prepared.lutLattice,
+      lutSize: prepared.lutSize,
+      lutDomainMin: prepared.lutDomainMin,
+      lutDomainMax: prepared.lutDomainMax,
+      intensity: intensity,
+      target: PhotoGradeTarget.full,
     );
   }
 }
@@ -107,67 +186,203 @@ PreparedPhoto _preparePhotoSync(PhotoPrepareRequest request) {
 
   // Cap the working resolution to keep processing time and memory bounded
   // on typical phone photos while still producing a shareable result.
-  const maxDimension = 3000;
-  if (image.width > maxDimension || image.height > maxDimension) {
+  if (image.width > kMaxFullResolutionDimension ||
+      image.height > kMaxFullResolutionDimension) {
     image = img.copyResize(
       image,
-      width: image.width >= image.height ? maxDimension : null,
-      height: image.height > image.width ? maxDimension : null,
+      width: image.width >= image.height ? kMaxFullResolutionDimension : null,
+      height: image.height > image.width ? kMaxFullResolutionDimension : null,
       interpolation: img.Interpolation.average,
     );
   }
 
   // Normalize to 8-bit-per-channel RGBA before pulling out raw bytes.
   // Without this, higher-bit-depth sources (e.g. 16-bit PNG/TIFF) hand back
-  // raw uint16 sample bytes from getBytes, which applyToRgbBytes would
+  // raw uint16 sample bytes from getBytes, which the LUT applier would
   // misinterpret as 8-bit RGBA and corrupt.
   image = image.convert(format: img.Format.uint8, numChannels: 4);
 
-  final rgbaBytes = image.getBytes(order: img.ChannelOrder.rgba);
+  final fullRgbaBytes = image.getBytes(order: img.ChannelOrder.rgba);
+
+  // Build the small preview copy used for the live slider regrade.
+  img.Image previewImage = image;
+  if (image.width > kMaxPreviewDimension || image.height > kMaxPreviewDimension) {
+    previewImage = img.copyResize(
+      image,
+      width: image.width >= image.height ? kMaxPreviewDimension : null,
+      height: image.height > image.width ? kMaxPreviewDimension : null,
+      interpolation: img.Interpolation.average,
+    );
+  }
+  final previewRgbaBytes = previewImage.getBytes(order: img.ChannelOrder.rgba);
+
   final lut = CubeLut.parse(request.cubeText);
 
   return PreparedPhoto(
-    rgbaBytes: rgbaBytes,
-    width: image.width,
-    height: image.height,
-    lut: lut,
+    fullRgbaBytes: fullRgbaBytes,
+    fullWidth: image.width,
+    fullHeight: image.height,
+    previewRgbaBytes: previewRgbaBytes,
+    previewWidth: previewImage.width,
+    previewHeight: previewImage.height,
+    lutLattice: lut.toFloat32Lattice(),
+    lutSize: lut.size,
+    lutDomainMin: lut.domainMin,
+    lutDomainMax: lut.domainMax,
   );
 }
 
-/// Applies [request.lut] to [request.rgbaBytes] at [request.intensity] and
-/// re-encodes the result as PNG.
+/// Applies the LUT to [request.rgbaBytes] at [request.intensity], splitting
+/// the image into horizontal row bands and grading them concurrently across
+/// multiple isolates ([gradingIsolateCount] of them), then re-encodes the
+/// reassembled result as JPEG.
 ///
 /// This is the cheap, repeatable half of grading: no decode, resize, or LUT
 /// parsing, just the pixel math and encode — safe to call on every intensity
 /// change once the photo has been [preparePhoto]d.
-///
-/// Runs in a background isolate via [Isolate.run] so the UI thread never
-/// blocks on it.
-Future<PhotoGradeResult> gradeCachedPhoto(PhotoRegradeRequest request) {
-  return Isolate.run(() => _gradeCachedPhotoSync(request));
-}
-
-PhotoGradeResult _gradeCachedPhotoSync(PhotoRegradeRequest request) {
-  // request.rgbaBytes arrived in this isolate as its own copy (isolate
-  // messages are deep-copied), so mutating it in place here is safe and
-  // never touches the caller's cached original.
-  final rgbaBytes = request.rgbaBytes;
-  request.lut.applyToRgbBytes(
-    rgbaBytes,
-    channelsPerPixel: 4,
+Future<PhotoGradeResult> gradeCachedPhoto(PhotoRegradeRequest request) async {
+  final gradedRgba = await gradeRgbaMulticore(
+    rgba: request.rgbaBytes,
+    width: request.width,
+    height: request.height,
+    lattice: request.lutLattice,
+    lutSize: request.lutSize,
+    domainMin: request.lutDomainMin,
+    domainMax: request.lutDomainMax,
     intensity: request.intensity,
   );
+
   final graded = img.Image.fromBytes(
     width: request.width,
     height: request.height,
-    bytes: rgbaBytes.buffer,
+    bytes: gradedRgba.buffer,
     order: img.ChannelOrder.rgba,
   );
 
-  final pngBytes = Uint8List.fromList(img.encodePng(graded));
+  final quality = request.target == PhotoGradeTarget.full
+      ? kFullSaveJpegQuality
+      : kPreviewJpegQuality;
+  final jpegBytes = await Isolate.run(
+    () => Uint8List.fromList(img.encodeJpg(graded, quality: quality)),
+  );
+
   return PhotoGradeResult(
-    gradedBytes: pngBytes,
+    gradedBytes: jpegBytes,
     width: request.width,
     height: request.height,
   );
+}
+
+/// One horizontal band of an RGBA image to grade in its own isolate.
+class _BandJob {
+  final Uint8List rgba;
+  final Float32List lattice;
+  final int lutSize;
+  final Color3 domainMin;
+  final Color3 domainMax;
+  final double intensity;
+
+  const _BandJob({
+    required this.rgba,
+    required this.lattice,
+    required this.lutSize,
+    required this.domainMin,
+    required this.domainMax,
+    required this.intensity,
+  });
+}
+
+Uint8List _gradeBandSync(_BandJob job) {
+  // job.rgba arrived in this isolate as its own copy (isolate messages are
+  // deep-copied), so mutating it in place here is safe and never touches the
+  // caller's cached buffer.
+  CubeLut.applyLutToRgbaBand(
+    job.rgba,
+    lattice: job.lattice,
+    lutSize: job.lutSize,
+    domainMin: job.domainMin,
+    domainMax: job.domainMax,
+    intensity: job.intensity,
+  );
+  return job.rgba;
+}
+
+/// Splits [rgba] (a `width`x`height` RGBA buffer) into horizontal row bands,
+/// grades each band concurrently in its own isolate, and reassembles the
+/// result — same output as applying the LUT to the whole buffer in one pass,
+/// just parallelized across cores.
+///
+/// The number of bands is [gradingIsolateCount], clamped so a band is never
+/// less than one row tall (a very short image just runs on fewer isolates).
+Future<Uint8List> gradeRgbaMulticore({
+  required Uint8List rgba,
+  required int width,
+  required int height,
+  required Float32List lattice,
+  required int lutSize,
+  required Color3 domainMin,
+  required Color3 domainMax,
+  required double intensity,
+}) async {
+  final bandCount = math.min(gradingIsolateCount(), height).clamp(1, height);
+  final bytesPerRow = width * 4;
+  final baseRows = height ~/ bandCount;
+  final extraRows = height % bandCount;
+
+  final jobs = <Future<Uint8List>>[];
+  var startRow = 0;
+  for (var band = 0; band < bandCount; band++) {
+    // Distribute the remainder rows one-per-band across the first
+    // `extraRows` bands so no band is more than one row larger than another.
+    final rowsInBand = baseRows + (band < extraRows ? 1 : 0);
+    if (rowsInBand == 0) continue;
+    final startByte = startRow * bytesPerRow;
+    final endByte = (startRow + rowsInBand) * bytesPerRow;
+    final bandBytes = Uint8List.sublistView(rgba, startByte, endByte);
+    jobs.add(Isolate.run(() => _gradeBandSync(_BandJob(
+          rgba: Uint8List.fromList(bandBytes),
+          lattice: lattice,
+          lutSize: lutSize,
+          domainMin: domainMin,
+          domainMax: domainMax,
+          intensity: intensity,
+        ))));
+    startRow += rowsInBand;
+  }
+
+  final gradedBands = await Future.wait(jobs);
+
+  final out = Uint8List(rgba.length);
+  var offset = 0;
+  for (final band in gradedBands) {
+    out.setRange(offset, offset + band.length, band);
+    offset += band.length;
+  }
+  return out;
+}
+
+/// Applies the LUT to the whole [rgba] buffer in a single pass, without
+/// splitting into bands or spawning isolates.
+///
+/// This exists as the correctness reference for [gradeRgbaMulticore] (which
+/// must produce byte-identical output, just faster by parallelizing across
+/// cores) and as a convenient synchronous path for tests/benchmarks.
+Uint8List gradeRgbaSinglePass({
+  required Uint8List rgba,
+  required Float32List lattice,
+  required int lutSize,
+  required Color3 domainMin,
+  required Color3 domainMax,
+  required double intensity,
+}) {
+  final copy = Uint8List.fromList(rgba);
+  CubeLut.applyLutToRgbaBand(
+    copy,
+    lattice: lattice,
+    lutSize: lutSize,
+    domainMin: domainMin,
+    domainMax: domainMax,
+    intensity: intensity,
+  );
+  return copy;
 }

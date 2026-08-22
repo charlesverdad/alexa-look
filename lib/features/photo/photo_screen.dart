@@ -1,18 +1,25 @@
 import 'dart:async';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:gal/gal.dart';
 import 'package:image_picker/image_picker.dart';
 
 import '../../core/lut_asset.dart';
+import '../../core/output_naming.dart';
 import '../../theme/app_theme.dart';
 import 'photo_processor.dart';
 
 enum _Stage { picking, processing, ready, saving, error }
 
 class PhotoScreen extends StatefulWidget {
-  const PhotoScreen({super.key});
+  /// When provided, this pre-picked file is graded directly instead of
+  /// opening the picker again — used by the home screen's multi-select flow
+  /// when exactly one photo was chosen, so it still lands in this richer
+  /// single-item editor.
+  final XFile? initialFile;
+
+  const PhotoScreen({super.key, this.initialFile});
 
   @override
   State<PhotoScreen> createState() => _PhotoScreenState();
@@ -21,15 +28,23 @@ class PhotoScreen extends StatefulWidget {
 class _PhotoScreenState extends State<PhotoScreen> {
   _Stage _stage = _Stage.picking;
   Uint8List? _originalBytes;
-  Uint8List? _gradedBytes;
+  Uint8List? _previewBytes;
   double _pendingIntensity = 1.0;
-  bool _showingOriginal = false;
+  bool _toggledOriginal = false;
+  bool _holdingOriginal = false;
   String? _errorMessage;
   String? _cubeText;
 
-  // Cached after the first grade so that dragging the intensity slider only
-  // re-runs the cheap LUT-apply + encode step, not decode/resize/LUT-parse.
+  // Cached after the first prepare so that dragging the intensity slider
+  // only re-runs the cheap LUT-apply + encode step on the small preview
+  // buffer, not decode/resize/LUT-parse or full-resolution work.
   PreparedPhoto? _prepared;
+
+  // Live-preview regrade throttling: at most one preview grade in flight at
+  // a time; if the slider moves again while one is running, only the latest
+  // requested intensity is kept and graded next ("latest wins").
+  bool _previewGrading = false;
+  double? _queuedPreviewIntensity;
 
   @override
   void initState() {
@@ -39,8 +54,11 @@ class _PhotoScreenState extends State<PhotoScreen> {
 
   Future<void> _pickAndProcess() async {
     try {
-      final picker = ImagePicker();
-      final file = await picker.pickImage(source: ImageSource.gallery);
+      XFile? file = widget.initialFile;
+      if (file == null) {
+        final picker = ImagePicker();
+        file = await picker.pickImage(source: ImageSource.gallery);
+      }
       if (file == null) {
         if (mounted) Navigator.of(context).pop();
         return;
@@ -57,7 +75,8 @@ class _PhotoScreenState extends State<PhotoScreen> {
       );
       if (!mounted) return;
       _prepared = prepared;
-      await _regrade(1.0);
+      setState(() => _stage = _Stage.ready);
+      unawaited(_requestPreviewGrade(_pendingIntensity));
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -67,38 +86,54 @@ class _PhotoScreenState extends State<PhotoScreen> {
     }
   }
 
-  Future<void> _regrade(double intensity) async {
-    final prepared = _prepared;
-    if (prepared == null) return;
-    setState(() => _stage = _Stage.processing);
-    try {
-      final result = await gradeCachedPhoto(
-        PhotoRegradeRequest.from(prepared, intensity),
-      );
-      if (!mounted) return;
-      setState(() {
-        _gradedBytes = result.gradedBytes;
-        _stage = _Stage.ready;
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _stage = _Stage.error;
-        _errorMessage = 'Could not apply the look: $e';
-      });
+  /// Requests a live preview regrade at [intensity]. Cheap and near-instant
+  /// (operates on the small downscaled preview buffer): safe to call on
+  /// every slider tick. At most one grade runs at a time; if one is already
+  /// in flight, [intensity] just replaces whatever was queued, and the
+  /// in-flight grade's completion picks it up next — the slider never falls
+  /// behind a backlog of stale requests.
+  Future<void> _requestPreviewGrade(double intensity) async {
+    _queuedPreviewIntensity = intensity;
+    if (_previewGrading) return;
+    _previewGrading = true;
+    while (_queuedPreviewIntensity != null) {
+      final target = _queuedPreviewIntensity!;
+      _queuedPreviewIntensity = null;
+      final prepared = _prepared;
+      if (prepared == null) break;
+      try {
+        final result = await gradeCachedPhoto(
+          PhotoRegradeRequest.preview(prepared, target),
+        );
+        if (!mounted) break;
+        setState(() => _previewBytes = result.gradedBytes);
+      } catch (_) {
+        // Keep showing the last good preview; a transient preview failure
+        // isn't worth interrupting the user with — saving will surface any
+        // real problem.
+      }
     }
+    _previewGrading = false;
   }
 
   Future<void> _save() async {
-    final graded = _gradedBytes;
-    if (graded == null) return;
+    final prepared = _prepared;
+    if (prepared == null) return;
     setState(() => _stage = _Stage.saving);
     try {
-      await Gal.putImageBytes(graded, name: 'alexa_look_${DateTime.now().millisecondsSinceEpoch}');
+      final result = await gradeCachedPhoto(
+        PhotoRegradeRequest.full(prepared, _pendingIntensity),
+      );
+      await Gal.putImageBytes(
+        result.gradedBytes,
+        album: kAlexaLookAlbum,
+        name: generateUniqueOutputName(),
+      );
       if (!mounted) return;
+      HapticFeedback.mediumImpact();
       setState(() => _stage = _Stage.ready);
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Saved to your gallery.')),
+        const SnackBar(content: Text('Saved to $kAlexaLookAlbum album')),
       );
     } catch (e) {
       if (!mounted) return;
@@ -118,18 +153,26 @@ class _PhotoScreenState extends State<PhotoScreen> {
         _Stage.error => _ErrorView(message: _errorMessage ?? 'Something went wrong.'),
         _ => _buildContent(),
       },
+      floatingActionButton: _stage == _Stage.error || _originalBytes == null
+          ? null
+          : _SaveFab(
+              saving: _stage == _Stage.saving,
+              enabled: _stage != _Stage.saving && _prepared != null,
+              onPressed: _save,
+            ),
     );
   }
 
   Widget _buildContent() {
     final original = _originalBytes;
-    final graded = _gradedBytes;
+    final preview = _previewBytes;
     if (original == null) {
       return const _CenteredProgress(label: 'Loading…');
     }
 
-    final bytesToShow = _showingOriginal || graded == null ? original : graded;
-    final isBusy = _stage == _Stage.processing || _stage == _Stage.saving;
+    final showOriginal = _toggledOriginal || _holdingOriginal || preview == null;
+    final bytesToShow = showOriginal ? original : preview;
+    final isSaving = _stage == _Stage.saving;
 
     return Column(
       children: [
@@ -137,41 +180,57 @@ class _PhotoScreenState extends State<PhotoScreen> {
           child: Stack(
             alignment: Alignment.center,
             children: [
-              Padding(
-                padding: const EdgeInsets.all(16),
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(16),
-                  child: Image.memory(
-                    bytesToShow,
-                    fit: BoxFit.contain,
-                    gaplessPlayback: true,
+              GestureDetector(
+                onLongPressStart: (_) => setState(() => _holdingOriginal = true),
+                onLongPressEnd: (_) => setState(() => _holdingOriginal = false),
+                onLongPressCancel: () => setState(() => _holdingOriginal = false),
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(16),
+                    child: Image.memory(
+                      bytesToShow,
+                      fit: BoxFit.contain,
+                      gaplessPlayback: true,
+                    ),
                   ),
                 ),
               ),
-              if (isBusy)
+              if (_previewGrading && !showOriginal)
+                const Positioned(
+                  bottom: 16,
+                  child: _SubtleBusyChip(label: 'Updating preview…'),
+                ),
+              if (isSaving)
                 Container(
-                  color: Colors.black.withValues(alpha: 0.35),
-                  child: const _CenteredProgress(label: 'Applying the look…'),
+                  color: Colors.black.withValues(alpha: 0.45),
+                  child: const _CenteredProgress(label: 'Applying the full-quality look…'),
                 ),
               Positioned(
                 top: 24,
                 right: 24,
                 child: _BeforeAfterToggle(
-                  showingOriginal: _showingOriginal,
-                  onChanged: graded == null
+                  showingOriginal: _toggledOriginal,
+                  onChanged: preview == null
                       ? null
-                      : (v) => setState(() => _showingOriginal = v),
+                      : (v) => setState(() => _toggledOriginal = v),
                 ),
+              ),
+              const Positioned(
+                bottom: 8,
+                left: 0,
+                right: 0,
+                child: _HoldHint(),
               ),
             ],
           ),
         ),
-        _buildControls(isBusy: isBusy),
+        _buildControls(isSaving: isSaving),
       ],
     );
   }
 
-  Widget _buildControls({required bool isBusy}) {
+  Widget _buildControls({required bool isSaving}) {
     return Container(
       padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
       decoration: const BoxDecoration(
@@ -199,18 +258,84 @@ class _PhotoScreenState extends State<PhotoScreen> {
           ),
           Slider(
             value: _pendingIntensity,
-            onChanged: isBusy
+            onChanged: isSaving || _prepared == null
                 ? null
-                : (v) => setState(() => _pendingIntensity = v),
-            onChangeEnd: isBusy ? null : (v) => _regrade(v),
+                : (v) {
+                    setState(() => _pendingIntensity = v);
+                    unawaited(_requestPreviewGrade(v));
+                  },
           ),
-          const SizedBox(height: 8),
-          ElevatedButton.icon(
-            onPressed: isBusy || _gradedBytes == null ? null : _save,
-            icon: const Icon(Icons.download_outlined),
-            label: const Text('Save to gallery'),
-          ),
+          const SizedBox(height: 60),
         ],
+      ),
+    );
+  }
+}
+
+class _SaveFab extends StatelessWidget {
+  final bool saving;
+  final bool enabled;
+  final VoidCallback onPressed;
+
+  const _SaveFab({required this.saving, required this.enabled, required this.onPressed});
+
+  @override
+  Widget build(BuildContext context) {
+    return FloatingActionButton.extended(
+      onPressed: enabled ? onPressed : null,
+      backgroundColor: enabled ? AppTheme.accent : AppTheme.surfaceHigh,
+      foregroundColor: Colors.black,
+      icon: saving
+          ? const SizedBox(
+              width: 18,
+              height: 18,
+              child: CircularProgressIndicator(strokeWidth: 2.4, color: Colors.black),
+            )
+          : const Icon(Icons.download_outlined),
+      label: Text(saving ? 'Saving…' : 'Save'),
+    );
+  }
+}
+
+class _HoldHint extends StatelessWidget {
+  const _HoldHint();
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Text(
+        'Press and hold to compare',
+        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: AppTheme.textSecondary.withValues(alpha: 0.8),
+            ),
+      ),
+    );
+  }
+}
+
+class _SubtleBusyChip extends StatelessWidget {
+  final String label;
+  const _SubtleBusyChip({required this.label});
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.black.withValues(alpha: 0.5),
+      borderRadius: BorderRadius.circular(16),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(
+              width: 12,
+              height: 12,
+              child: CircularProgressIndicator(strokeWidth: 2, color: AppTheme.accent),
+            ),
+            const SizedBox(width: 8),
+            Text(label, style: const TextStyle(color: Colors.white, fontSize: 12)),
+          ],
+        ),
       ),
     );
   }
