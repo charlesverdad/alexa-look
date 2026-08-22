@@ -8,6 +8,8 @@ import 'package:image_picker/image_picker.dart';
 import '../../core/lut_asset.dart';
 import '../../core/output_naming.dart';
 import '../../theme/app_theme.dart';
+import '../results/exported_item.dart';
+import '../results/results_screen.dart';
 import 'video_processor.dart';
 
 enum _Stage { picking, preparing, processing, done, error }
@@ -110,19 +112,26 @@ class _VideoScreenState extends State<VideoScreen> {
   Future<void> _save() async {
     final path = _outputPath;
     if (path == null) return;
-    var didSave = false;
     try {
       await Gal.putVideo(path, album: kAlexaLookAlbum);
-      didSave = true;
       if (!mounted) return;
       HapticFeedback.mediumImpact();
-      final encoderLabel = _encoderUsed?.label;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            encoderLabel == null
-                ? 'Saved to $kAlexaLookAlbum album'
-                : 'Saved to $kAlexaLookAlbum album · $encoderLabel',
+      // The graded mp4 already lives in the temp dir — keep it there
+      // (rather than deleting it now that it's copied into the gallery) so
+      // the results screen can still offer Share while it's open. It's
+      // deleted when that screen is dismissed instead, see
+      // ResultsSession.dispose.
+      await Navigator.of(context).push(
+        AppTheme.route(
+          ResultsScreen(
+            items: [
+              ExportedItem(
+                id: generateUniqueOutputName(),
+                kind: ExportedKind.video,
+                tempFilePath: path,
+              ),
+            ],
+            summary: _encoderUsed == null ? null : 'Encoded with ${_encoderUsed!.label}',
           ),
         ),
       );
@@ -131,13 +140,6 @@ class _VideoScreenState extends State<VideoScreen> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Could not save: $e')),
       );
-    } finally {
-      // The graded mp4 lives in the temp dir and is only needed until it's
-      // been copied into the gallery — clean it up now so temp output
-      // doesn't accumulate on disk.
-      if (didSave) {
-        await deleteTempVideoBestEffort(path);
-      }
     }
   }
 

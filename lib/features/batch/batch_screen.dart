@@ -1,26 +1,35 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:gal/gal.dart';
-import 'package:image_picker/image_picker.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../../core/lut_asset.dart';
+import '../../core/media_detector.dart';
+import '../../core/media_routing.dart';
 import '../../core/output_naming.dart';
 import '../../theme/app_theme.dart';
 import '../photo/photo_processor.dart';
+import '../results/exported_item.dart';
+import '../results/results_screen.dart';
 import '../video/video_processor.dart';
 import 'batch_controller.dart';
 import 'batch_models.dart';
+import 'batch_raw_processor.dart';
 
-/// Multi-select batch flow: grades every picked photo/video with one shared
-/// intensity and saves each straight into the dedicated gallery album as it
-/// finishes. Cancellable between items; whatever has already saved stays
-/// saved.
+/// Multi-select batch flow: grades every picked photo/RAW/video with one
+/// shared intensity and saves each straight into the dedicated gallery
+/// album as it finishes. Cancellable between items; whatever has already
+/// saved stays saved. Ends by showing the results screen for whatever was
+/// exported (see `lib/features/results/results_screen.dart`), rather than
+/// just a "saved" snackbar.
 class BatchScreen extends StatefulWidget {
-  final List<XFile> files;
+  final List<RoutableMedia> items;
 
-  const BatchScreen({super.key, required this.files});
+  const BatchScreen({super.key, required this.items});
 
   @override
   State<BatchScreen> createState() => _BatchScreenState();
@@ -32,13 +41,18 @@ class _BatchScreenState extends State<BatchScreen> {
   PreparedLut? _preparedLut;
   VideoGradeSession? _activeGradeSession;
 
+  /// Populated as each item finishes saving, keyed by [BatchItem.id] —
+  /// handed to the results screen once the run completes.
+  final Map<String, ExportedItem> _exported = {};
+
   @override
   void initState() {
     super.initState();
-    final items = widget.files.map(BatchItem.fromFile).toList();
+    final items = widget.items.map((m) => BatchItem.fromRoutable(m)).toList();
     _controller = BatchController(
       items: items,
       processPhoto: _processPhoto,
+      processRaw: _processRaw,
       processVideo: _processVideo,
     )..addListener(_onControllerChanged);
   }
@@ -56,7 +70,25 @@ class _BatchScreenState extends State<BatchScreen> {
     // is marked cancelled rather than saved).
     _controller.cancel();
     _activeGradeSession?.cancel();
+    unawaited(WakelockPlus.disable());
     super.dispose();
+  }
+
+  /// Shared tail of both the photo and RAW pipelines: save the graded JPEG
+  /// bytes into the gallery album, and also stash a temp-file copy for the
+  /// results screen to offer Share from (see `ExportedItem`).
+  Future<void> _saveGradedPhoto(BatchItem item, Uint8List gradedBytes) async {
+    final outputName = generateUniqueOutputName();
+    await Gal.putImageBytes(gradedBytes, album: kAlexaLookAlbum, name: outputName);
+    final tempDir = await getTemporaryDirectory();
+    final tempPath = '${tempDir.path}/$outputName.jpg';
+    await File(tempPath).writeAsBytes(gradedBytes, flush: true);
+    _exported[item.id] = ExportedItem(
+      id: item.id,
+      kind: ExportedKind.photo,
+      tempFilePath: tempPath,
+      previewBytes: gradedBytes,
+    );
   }
 
   Future<void> _processPhoto(
@@ -65,11 +97,11 @@ class _BatchScreenState extends State<BatchScreen> {
     BatchProgressCallback onProgress,
   ) async {
     // Parse the `.cube` LUT once for the whole batch and reuse the parsed
-    // lattice for every item — CubeLut.parse is wasted work to repeat per
-    // photo when every item shares the same look.
+    // lattice for every item (photo and RAW alike) — CubeLut.parse is
+    // wasted work to repeat per item when every item shares the same look.
     final preparedLut = _preparedLut ??= PreparedLut.parse(await loadAlexaLookLutText());
     onProgress(0.05);
-    final bytes = await item.file.readAsBytes();
+    final bytes = await File(item.path).readAsBytes();
     onProgress(0.15);
     final prepared = await preparePhoto(
       PhotoPrepareRequest(
@@ -86,12 +118,23 @@ class _BatchScreenState extends State<BatchScreen> {
       PhotoRegradeRequest.full(prepared, intensity),
     );
     onProgress(0.85);
-    await Gal.putImageBytes(
-      result.gradedBytes,
-      album: kAlexaLookAlbum,
-      name: generateUniqueOutputName(),
-    );
+    await _saveGradedPhoto(item, result.gradedBytes);
     onProgress(1.0);
+  }
+
+  Future<void> _processRaw(
+    BatchItem item,
+    double intensity,
+    BatchProgressCallback onProgress,
+  ) async {
+    final preparedLut = _preparedLut ??= PreparedLut.parse(await loadAlexaLookLutText());
+    final gradedBytes = await gradeRawBatchItem(
+      path: item.path,
+      intensity: intensity,
+      preparedLut: preparedLut,
+      onProgress: onProgress,
+    );
+    await _saveGradedPhoto(item, gradedBytes);
   }
 
   Future<void> _processVideo(
@@ -106,7 +149,7 @@ class _BatchScreenState extends State<BatchScreen> {
     // at full look strength regardless of the shared intensity slider.
     final lutFile = await ensureAlexaLookLutFile();
     final session = await gradeVideoToTempFile(
-      inputPath: item.file.path,
+      inputPath: item.path,
       lutPath: lutFile.path,
       onProgress: onProgress,
     );
@@ -114,44 +157,68 @@ class _BatchScreenState extends State<BatchScreen> {
     try {
       final result = await session.result;
       await Gal.putVideo(result.path, album: kAlexaLookAlbum);
-      await deleteTempVideoBestEffort(result.path);
+      // Unlike before, the temp mp4 is *not* deleted here — it's kept
+      // around so the results screen can still offer Share while it's
+      // open, and cleaned up when that screen is dismissed instead (see
+      // ResultsSession.dispose).
+      _exported[item.id] = ExportedItem(
+        id: item.id,
+        kind: ExportedKind.video,
+        tempFilePath: result.path,
+      );
     } finally {
       _activeGradeSession = null;
     }
   }
 
   Future<void> _run() async {
-    await _controller.run(_intensity);
-    if (!mounted) return;
-    if (_controller.failedCount == 0) {
-      HapticFeedback.mediumImpact();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            'Saved ${_controller.doneCount} item${_controller.doneCount == 1 ? '' : 's'} '
-            'to $kAlexaLookAlbum album',
-          ),
-        ),
-      );
-    } else {
-      final cancelledSuffix =
-          _controller.cancelledCount == 0 ? '' : ', ${_controller.cancelledCount} cancelled';
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            '${_controller.doneCount} saved, ${_controller.failedCount} failed$cancelledSuffix. '
-            'Tap a failed item to see why.',
-          ),
-        ),
-      );
+    // Prevent the screen from sleeping mid-batch — a batch run can take
+    // minutes (several video encodes back to back), and losing the screen
+    // shouldn't interrupt it. Cheap, no foreground-service machinery
+    // required; see the README for the (deliberate) limits of this.
+    await WakelockPlus.enable();
+    try {
+      await _controller.run(_intensity);
+    } finally {
+      unawaited(WakelockPlus.disable());
     }
+    if (!mounted) return;
+
+    final items = _controller.items;
+    final exportedItems = [
+      for (final item in items) ?_exported[item.id],
+    ];
+
+    String? summary;
+    if (_controller.failedCount > 0 || _controller.cancelledCount > 0) {
+      final parts = <String>[
+        if (_controller.failedCount > 0) '${_controller.failedCount} failed',
+        if (_controller.cancelledCount > 0) '${_controller.cancelledCount} cancelled',
+      ];
+      summary = parts.join(', ');
+    }
+
+    if (exportedItems.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(summary == null ? 'Nothing was saved.' : 'Nothing was saved — $summary.'),
+        ),
+      );
+      return;
+    }
+
+    HapticFeedback.mediumImpact();
+    await Navigator.of(context).push(
+      AppTheme.route(ResultsScreen(items: exportedItems, summary: summary)),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     final items = _controller.items;
-    final photoCount = items.where((i) => i.type == BatchMediaType.photo).length;
-    final videoCount = items.length - photoCount;
+    final photoCount = items.where((i) => i.type == MediaCategory.photo).length;
+    final rawCount = items.where((i) => i.type == MediaCategory.raw).length;
+    final videoCount = items.where((i) => i.type == MediaCategory.video).length;
 
     return Scaffold(
       appBar: AppBar(
@@ -171,8 +238,7 @@ class _BatchScreenState extends State<BatchScreen> {
             child: Row(
               children: [
                 Text(
-                  '$photoCount photo${photoCount == 1 ? '' : 's'}, '
-                  '$videoCount video${videoCount == 1 ? '' : 's'}',
+                  _summaryLabel(photoCount: photoCount, rawCount: rawCount, videoCount: videoCount),
                   style: const TextStyle(color: AppTheme.textSecondary),
                 ),
                 const Spacer(),
@@ -201,12 +267,21 @@ class _BatchScreenState extends State<BatchScreen> {
     );
   }
 
+  String _summaryLabel({required int photoCount, required int rawCount, required int videoCount}) {
+    final parts = <String>[
+      if (photoCount > 0) '$photoCount photo${photoCount == 1 ? '' : 's'}',
+      if (rawCount > 0) '$rawCount RAW',
+      if (videoCount > 0) '$videoCount video${videoCount == 1 ? '' : 's'}',
+    ];
+    return parts.join(', ');
+  }
+
   Widget _buildControls() {
     final running = _controller.isRunning;
     final complete = _controller.isComplete;
     final items = _controller.items;
-    final hasVideos = items.any((i) => i.type == BatchMediaType.video);
-    final videosOnly = items.isNotEmpty && items.every((i) => i.type == BatchMediaType.video);
+    final hasVideos = items.any((i) => i.type == MediaCategory.video);
+    final videosOnly = items.isNotEmpty && items.every((i) => i.type == MediaCategory.video);
     return Container(
       padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
       decoration: const BoxDecoration(
@@ -283,17 +358,26 @@ class _BatchTile extends StatelessWidget {
         children: [
           Container(
             color: AppTheme.surfaceHigh,
-            child: item.type == BatchMediaType.photo
-                ? Image.file(
-                    File(item.file.path),
-                    fit: BoxFit.cover,
-                    cacheWidth: 240,
-                    errorBuilder: (context, error, stack) => const Icon(
-                      Icons.broken_image_outlined,
-                      color: AppTheme.textSecondary,
-                    ),
-                  )
-                : const _VideoPlaceholder(),
+            child: switch (item.type) {
+              MediaCategory.photo => Image.file(
+                  File(item.path),
+                  fit: BoxFit.cover,
+                  cacheWidth: 240,
+                  errorBuilder: (context, error, stack) => const Icon(
+                    Icons.broken_image_outlined,
+                    color: AppTheme.textSecondary,
+                  ),
+                ),
+              // A DNG's raw file bytes aren't directly displayable — showing
+              // a placeholder icon here (rather than decoding an embedded
+              // preview per grid tile) keeps the batch grid itself cheap;
+              // the RAW decode chain still runs in full once this item is
+              // actually processed.
+              MediaCategory.raw => const _TypeIconPlaceholder(icon: Icons.camera_outlined),
+              MediaCategory.video => const _TypeIconPlaceholder(icon: Icons.videocam_outlined),
+              MediaCategory.unsupported =>
+                const _TypeIconPlaceholder(icon: Icons.error_outline),
+            },
           ),
           _StatusOverlay(item: item),
         ],
@@ -302,13 +386,14 @@ class _BatchTile extends StatelessWidget {
   }
 }
 
-class _VideoPlaceholder extends StatelessWidget {
-  const _VideoPlaceholder();
+class _TypeIconPlaceholder extends StatelessWidget {
+  final IconData icon;
+  const _TypeIconPlaceholder({required this.icon});
 
   @override
   Widget build(BuildContext context) {
-    return const Center(
-      child: Icon(Icons.videocam_outlined, color: AppTheme.textSecondary, size: 32),
+    return Center(
+      child: Icon(icon, color: AppTheme.textSecondary, size: 32),
     );
   }
 }
