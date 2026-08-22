@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:ffmpeg_kit_flutter_new_full/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new_full/ffprobe_kit.dart';
@@ -51,9 +52,11 @@ class _VideoScreenState extends State<VideoScreen> {
         if (mounted) Navigator.of(context).pop();
         return;
       }
+      if (!mounted) return;
       setState(() => _stage = _Stage.preparing);
       await _process(file.path);
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _stage = _Stage.error;
         _errorMessage = 'Could not load that video: $e';
@@ -64,9 +67,12 @@ class _VideoScreenState extends State<VideoScreen> {
   Future<void> _process(String inputPath) async {
     try {
       final lutFile = await ensureAlexaLookLutFile();
-      final docsDir = await getApplicationDocumentsDirectory();
+      // Written to the temp dir (not app documents) since graded videos are
+      // only needed transiently: [_save] deletes this file once it has been
+      // copied into the gallery, so temp output never accumulates on disk.
+      final tempDir = await getTemporaryDirectory();
       final outputPath =
-          '${docsDir.path}/alexa_look_${DateTime.now().millisecondsSinceEpoch}.mp4';
+          '${tempDir.path}/alexa_look_${DateTime.now().millisecondsSinceEpoch}.mp4';
 
       // Ask ffprobe for the input duration so we can report real progress.
       double? durationSeconds;
@@ -85,6 +91,7 @@ class _VideoScreenState extends State<VideoScreen> {
           "-c:v mpeg4 -q:v 3 -c:a copy "
           "${_quotePath(outputPath)}";
 
+      if (!mounted) return;
       setState(() => _stage = _Stage.processing);
 
       final completer = Completer<void>();
@@ -92,20 +99,27 @@ class _VideoScreenState extends State<VideoScreen> {
         command,
         (session) async {
           final returnCode = await session.getReturnCode();
-          if (!mounted) return;
-          if (ReturnCode.isSuccess(returnCode)) {
-            setState(() {
-              _stage = _Stage.done;
-              _outputPath = outputPath;
-              _progress = 1;
-            });
-          } else {
-            final logs = await session.getOutput();
-            setState(() {
-              _stage = _Stage.error;
-              _errorMessage = 'ffmpeg failed (code $returnCode).\n${logs ?? ''}';
-            });
+          final success = ReturnCode.isSuccess(returnCode);
+          // Only fetch logs on failure — this await must happen before the
+          // mounted check below covers it, since another await elapses here.
+          final logs = success ? null : await session.getOutput();
+          if (mounted) {
+            if (success) {
+              setState(() {
+                _stage = _Stage.done;
+                _outputPath = outputPath;
+                _progress = 1;
+              });
+            } else {
+              setState(() {
+                _stage = _Stage.error;
+                _errorMessage = 'ffmpeg failed (code $returnCode).\n${logs ?? ''}';
+              });
+            }
           }
+          // Complete regardless of mounted: _process awaits this future, and
+          // if it never completes because the screen was disposed mid-encode,
+          // that await (and the outer call stack) hangs forever.
           if (!completer.isCompleted) completer.complete();
         },
         null,
@@ -132,8 +146,10 @@ class _VideoScreenState extends State<VideoScreen> {
   Future<void> _save() async {
     final path = _outputPath;
     if (path == null) return;
+    var didSave = false;
     try {
       await Gal.putVideo(path);
+      didSave = true;
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Saved to your gallery.')),
@@ -143,6 +159,18 @@ class _VideoScreenState extends State<VideoScreen> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Could not save: $e')),
       );
+    } finally {
+      // The graded mp4 lives in the temp dir and is only needed until it's
+      // been copied into the gallery — clean it up now so temp output
+      // doesn't accumulate on disk. Best-effort: a failure here (e.g. the
+      // file is already gone) shouldn't surface as a save error.
+      if (didSave) {
+        try {
+          await File(path).delete();
+        } catch (_) {
+          // Ignore — nothing useful to do if cleanup fails.
+        }
+      }
     }
   }
 

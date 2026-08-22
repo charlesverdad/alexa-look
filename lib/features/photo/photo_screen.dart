@@ -27,6 +27,10 @@ class _PhotoScreenState extends State<PhotoScreen> {
   String? _errorMessage;
   String? _cubeText;
 
+  // Cached after the first grade so that dragging the intensity slider only
+  // re-runs the cheap LUT-apply + encode step, not decode/resize/LUT-parse.
+  PreparedPhoto? _prepared;
+
   @override
   void initState() {
     super.initState();
@@ -42,13 +46,20 @@ class _PhotoScreenState extends State<PhotoScreen> {
         return;
       }
       final bytes = await file.readAsBytes();
-      _cubeText ??= await loadAlexaLookLutText();
+      final cubeText = _cubeText ??= await loadAlexaLookLutText();
+      if (!mounted) return;
       setState(() {
         _originalBytes = bytes;
         _stage = _Stage.processing;
       });
+      final prepared = await preparePhoto(
+        PhotoPrepareRequest(originalBytes: bytes, cubeText: cubeText),
+      );
+      if (!mounted) return;
+      _prepared = prepared;
       await _regrade(1.0);
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _stage = _Stage.error;
         _errorMessage = 'Could not load that photo: $e';
@@ -57,17 +68,12 @@ class _PhotoScreenState extends State<PhotoScreen> {
   }
 
   Future<void> _regrade(double intensity) async {
-    final original = _originalBytes;
-    final cubeText = _cubeText;
-    if (original == null || cubeText == null) return;
+    final prepared = _prepared;
+    if (prepared == null) return;
     setState(() => _stage = _Stage.processing);
     try {
-      final result = await gradePhoto(
-        PhotoGradeRequest(
-          originalBytes: original,
-          cubeText: cubeText,
-          intensity: intensity,
-        ),
+      final result = await gradeCachedPhoto(
+        PhotoRegradeRequest.from(prepared, intensity),
       );
       if (!mounted) return;
       setState(() {
@@ -137,7 +143,6 @@ class _PhotoScreenState extends State<PhotoScreen> {
                   borderRadius: BorderRadius.circular(16),
                   child: Image.memory(
                     bytesToShow,
-                    key: ValueKey(_showingOriginal),
                     fit: BoxFit.contain,
                     gaplessPlayback: true,
                   ),
