@@ -5,7 +5,7 @@
         android:maxSdkVersion="29" />
 
     <application
-        android:label="alexa_look"
+        android:label="Alexa Look"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:requestLegacyExternalStorage="true">
