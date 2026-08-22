@@ -1,15 +1,36 @@
+import 'dart:async';
+import 'dart:io';
+
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 
+import '../../core/media_detector.dart';
+import '../../core/media_routing.dart';
 import '../../theme/app_theme.dart';
-import '../batch/batch_models.dart';
 import '../batch/batch_screen.dart';
 import '../photo/photo_screen.dart';
 import '../video/video_screen.dart';
+import 'about_sheet.dart';
 
-/// The app's entry screen: pick a photo, video, or multiple items to apply
-/// the look to.
+/// File extensions offered by the "Browse files…" picker — anything the
+/// mixed photo/video gallery picker can already surface plus formats it
+/// typically can't (notably DNG). Case-insensitive: file_picker matches
+/// extensions case-insensitively.
+const List<String> kBrowsableFileExtensions = [
+  'jpg', 'jpeg', 'png', 'heic', 'heif', 'webp', 'tiff', 'tif', 'dng',
+  'mp4', 'mov', 'm4v', 'webm', 'mkv', 'avi',
+];
+
+/// The app's entry screen: one primary "Select media" action (mixed
+/// photo+video, multi-select) plus a secondary "Browse files…" for anything
+/// the gallery picker can't surface. What each selected file actually *is*
+/// (photo, RAW, or video) is decided by content, not by which picker
+/// produced it — see `lib/core/media_detector.dart` and
+/// `lib/core/media_routing.dart` — and files shared into the app from
+/// another app (Android only) flow through that exact same routing.
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
 
@@ -18,65 +39,130 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  bool _pickingMedia = false;
-  bool _pickingRaw = false;
+  bool _busy = false;
+  PackageInfo? _packageInfo;
 
-  Future<void> _importRaw() async {
-    if (_pickingRaw) return;
-    setState(() => _pickingRaw = true);
-    try {
-      final file = await FilePicker.pickFile(
-        type: FileType.custom,
-        allowedExtensions: ['dng', 'DNG'],
+  StreamSubscription<List<SharedMediaFile>>? _shareStreamSub;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadPackageInfo());
+    if (Platform.isAndroid) {
+      unawaited(_handleInitialShare());
+      _shareStreamSub = ReceiveSharingIntent.instance.getMediaStream().listen(
+        (files) => unawaited(_handleSharedFiles(files)),
       );
-      if (!mounted) return;
-      final path = file?.path;
-      if (path == null) return;
-      await Navigator.of(context).push(
-        AppTheme.route(PhotoScreen(initialRawPath: path)),
+    }
+  }
+
+  @override
+  void dispose() {
+    unawaited(_shareStreamSub?.cancel());
+    super.dispose();
+  }
+
+  Future<void> _loadPackageInfo() async {
+    final info = await PackageInfo.fromPlatform();
+    if (mounted) setState(() => _packageInfo = info);
+  }
+
+  Future<void> _handleInitialShare() async {
+    final files = await ReceiveSharingIntent.instance.getInitialMedia();
+    await _handleSharedFiles(files);
+  }
+
+  Future<void> _handleSharedFiles(List<SharedMediaFile> files) async {
+    if (files.isEmpty) return;
+    // Consumed — don't hand the same shared files back on the next cold
+    // start / stream listener attach.
+    unawaited(ReceiveSharingIntent.instance.reset());
+    if (!mounted) return;
+    await _routePaths(files.map((f) => f.path).toList());
+  }
+
+  /// Classifies every path by content (see `classifyMediaFile`) and routes
+  /// the result: a single supported item opens straight into its editor, an
+  /// unsupported one is reported, and multiple supported items open the
+  /// unified batch screen. Shared by the gallery picker, the file browser,
+  /// and incoming share intents, so all three funnel through one decision.
+  Future<void> _routePaths(List<String> paths) async {
+    if (paths.isEmpty) return;
+    final items = await Future.wait(paths.map((path) async {
+      return RoutableMedia(path: path, detection: await classifyMediaFile(path));
+    }));
+    if (!mounted) return;
+
+    final decision = decideMediaRoute(items);
+    if (decision.unsupported.isNotEmpty) {
+      final n = decision.unsupported.length;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            n == 1
+                ? "Couldn't use 1 file — unrecognized format."
+                : "Couldn't use $n files — unrecognized format.",
+          ),
+        ),
       );
-    } finally {
-      if (mounted) setState(() => _pickingRaw = false);
+    }
+
+    switch (decision.route) {
+      case NothingToRoute():
+        break;
+      case OpenPhotoEditor(:final media):
+        await Navigator.of(context).push(
+          AppTheme.route(PhotoScreen(initialFile: XFile(media.path))),
+        );
+      case OpenRawEditor(:final media):
+        await Navigator.of(context).push(
+          AppTheme.route(PhotoScreen(initialRawPath: media.path)),
+        );
+      case OpenVideoEditor(:final media):
+        await Navigator.of(context).push(
+          AppTheme.route(VideoScreen(initialFile: XFile(media.path))),
+        );
+      case OpenBatch(:final items):
+        await Navigator.of(context).push(
+          AppTheme.route(BatchScreen(items: items)),
+        );
     }
   }
 
   Future<void> _selectMedia() async {
-    if (_pickingMedia) return;
-    setState(() => _pickingMedia = true);
+    if (_busy) return;
+    setState(() => _busy = true);
     try {
       final picker = ImagePicker();
       final files = await picker.pickMultipleMedia();
-      if (!mounted || files.isEmpty) return;
-
-      if (files.length == 1) {
-        // A single pick still gets the richer single-item editor, not the
-        // grid-based batch flow.
-        final file = files.first;
-        final type = classifyMediaType(file);
-        await Navigator.of(context).push(
-          AppTheme.route(
-            type == BatchMediaType.photo
-                ? PhotoScreen(initialFile: file)
-                : VideoScreen(initialFile: file),
-          ),
-        );
-      } else {
-        await Navigator.of(context).push(
-          AppTheme.route(BatchScreen(files: files)),
-        );
-      }
+      if (!mounted) return;
+      await _routePaths(files.map((f) => f.path).toList());
     } finally {
-      if (mounted) setState(() => _pickingMedia = false);
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _browseFiles() async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      final files = await FilePicker.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: kBrowsableFileExtensions,
+        // ignore: deprecated_member_use
+        allowMultiple: true,
+      );
+      if (!mounted) return;
+      final paths = [for (final f in files) if (f.path != null) f.path!];
+      await _routePaths(paths);
+    } finally {
+      if (mounted) setState(() => _busy = false);
     }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      // A LayoutBuilder + SingleChildScrollView + a min-height ConstrainedBox
-      // (rather than Spacers) centers this content on tall screens while
-      // still scrolling instead of overflowing on short ones — needed now
-      // that there are four action buttons plus the footer text.
       body: SafeArea(
         child: LayoutBuilder(
           builder: (context, constraints) {
@@ -113,74 +199,30 @@ class _HomeScreenState extends State<HomeScreen> {
                             color: AppTheme.textSecondary,
                           ),
                     ),
-                    const SizedBox(height: 40),
+                    const SizedBox(height: 48),
                     _ActionButton(
-                      icon: Icons.photo_outlined,
-                      label: 'Photo',
-                      subtitle: 'Grade a single photo, live preview as you adjust',
-                      onTap: () => Navigator.of(context).push(
-                        AppTheme.route(const PhotoScreen()),
-                      ),
-                    ),
-                    const SizedBox(height: 14),
-                    _ActionButton(
-                      icon: Icons.videocam_outlined,
-                      label: 'Video',
-                      subtitle: 'Grade a single video clip with ffmpeg',
-                      onTap: () => Navigator.of(context).push(
-                        AppTheme.route(const VideoScreen()),
-                      ),
-                    ),
-                    const SizedBox(height: 14),
-                    _ActionButton(
-                      icon: Icons.grid_view_outlined,
-                      label: 'Batch',
-                      subtitle: 'Select multiple photos & videos and grade them all at once',
-                      busy: _pickingMedia,
+                      icon: Icons.add_photo_alternate_outlined,
+                      label: 'Select media',
+                      subtitle: 'Photos, RAW/DNG, and videos — pick one or many',
+                      busy: _busy,
                       onTap: _selectMedia,
                     ),
                     const SizedBox(height: 14),
-                    _ActionButton(
-                      icon: Icons.camera_outlined,
-                      label: 'RAW',
-                      subtitle: 'Import DNG (Xiaomi Pro mode)',
-                      busy: _pickingRaw,
-                      onTap: _importRaw,
+                    Center(
+                      child: TextButton.icon(
+                        onPressed: _busy ? null : _browseFiles,
+                        icon: const Icon(Icons.folder_open_outlined, size: 18),
+                        label: const Text('Browse files…'),
+                      ),
                     ),
                     const SizedBox(height: 40),
-                    Text(
-                      'Original files are never modified.',
-                      textAlign: TextAlign.center,
-                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                            color: AppTheme.textSecondary,
-                            fontWeight: FontWeight.w600,
-                          ),
-                    ),
-                    const SizedBox(height: 6),
-                    Text(
-                      '"ARRI" and "ALEXA" are trademarks of Arnold & Richter Cine '
-                      'Technik GmbH & Co. KG. Alexa Look is an independent, '
-                      'unaffiliated app.',
-                      textAlign: TextAlign.center,
-                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                            color: AppTheme.textSecondary.withValues(alpha: 0.7),
-                          ),
-                    ),
-                    const SizedBox(height: 8),
-                    // Open-source licenses used by the app, including the
-                    // vendored LibRaw (RAW/DNG decoding) — see
-                    // lib/core/licenses.dart.
                     Center(
                       child: TextButton(
-                        onPressed: () => showLicensePage(
-                          context: context,
-                          applicationName: 'Alexa Look',
-                        ),
+                        onPressed: () => showAboutSheet(context, _packageInfo),
                         child: Text(
-                          'Licenses',
+                          _packageInfo == null ? ' ' : 'v${_packageInfo!.version}',
                           style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                                color: AppTheme.textSecondary.withValues(alpha: 0.7),
-                                decoration: TextDecoration.underline,
+                                color: AppTheme.textSecondary.withValues(alpha: 0.6),
                               ),
                         ),
                       ),

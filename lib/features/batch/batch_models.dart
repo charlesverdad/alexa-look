@@ -1,25 +1,13 @@
-import 'package:image_picker/image_picker.dart';
+import '../../core/media_detector.dart';
+import '../../core/media_routing.dart';
 
-/// The two kinds of media the batch flow (and the single-item editors)
-/// handle.
-enum BatchMediaType { photo, video }
-
-/// Video file extensions [image_picker]'s mixed image+video picker can hand
-/// back, used to classify each picked [XFile] since `pickMultipleMedia`
-/// returns a single untyped list. Not exhaustive of every video container in
-/// existence, just the ones a phone gallery picker plausibly returns.
-const Set<String> _videoExtensions = {
-  'mp4', 'mov', 'm4v', 'avi', 'mkv', 'webm', '3gp', '3gpp',
-};
-
-/// Classifies [file] as a photo or video by its extension.
-BatchMediaType classifyMediaType(XFile file) {
-  final path = file.path;
-  final dot = path.lastIndexOf('.');
-  if (dot == -1 || dot == path.length - 1) return BatchMediaType.photo;
-  final ext = path.substring(dot + 1).toLowerCase();
-  return _videoExtensions.contains(ext) ? BatchMediaType.video : BatchMediaType.photo;
-}
+/// The three kinds of media the batch flow (and the single-item editors)
+/// handle. Batch item classification is content-based (see
+/// `lib/core/media_detector.dart`), so this is just [MediaCategory] under a
+/// name local to the batch feature — [MediaCategory.unsupported] never
+/// appears on a real [BatchItem]: unsupported files are filtered out by
+/// `decideMediaRoute` before a batch is ever opened.
+typedef BatchMediaType = MediaCategory;
 
 /// Where a single [BatchItem] is in the batch pipeline.
 ///
@@ -29,11 +17,11 @@ BatchMediaType classifyMediaType(XFile file) {
 /// nothing was saved for that item, and it isn't a failure to report.
 enum BatchItemStatus { queued, processing, done, failed, cancelled }
 
-/// One item in a batch run: a picked file, its classified media type, and
-/// its current pipeline status/progress/error.
+/// One item in a batch run: a picked file's path, its content-classified
+/// media type, and its current pipeline status/progress/error.
 class BatchItem {
   final String id;
-  final XFile file;
+  final String path;
   final BatchMediaType type;
   BatchItemStatus status;
   double progress;
@@ -41,18 +29,18 @@ class BatchItem {
 
   BatchItem({
     required this.id,
-    required this.file,
+    required this.path,
     required this.type,
     this.status = BatchItemStatus.queued,
     this.progress = 0,
     this.error,
   });
 
-  factory BatchItem.fromFile(XFile file, {String? id}) {
+  factory BatchItem.fromRoutable(RoutableMedia media, {String? id}) {
     return BatchItem(
-      id: id ?? '${file.path}#${identityHashCode(file)}',
-      file: file,
-      type: classifyMediaType(file),
+      id: id ?? '${media.path}#${identityHashCode(media)}',
+      path: media.path,
+      type: media.detection.category,
     );
   }
 }

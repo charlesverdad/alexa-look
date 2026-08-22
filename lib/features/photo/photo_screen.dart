@@ -5,11 +5,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:gal/gal.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:path_provider/path_provider.dart';
 
 import '../../core/lut_asset.dart';
 import '../../core/output_naming.dart';
 import '../../core/raw_import.dart';
 import '../../theme/app_theme.dart';
+import '../results/exported_item.dart';
+import '../results/results_screen.dart';
 import 'photo_processor.dart';
 
 enum _Stage { picking, processing, ready, saving, error }
@@ -180,16 +183,35 @@ class _PhotoScreenState extends State<PhotoScreen> {
       final result = await gradeCachedPhoto(
         PhotoRegradeRequest.full(prepared, _pendingIntensity),
       );
+      final outputName = generateUniqueOutputName();
       await Gal.putImageBytes(
         result.gradedBytes,
         album: kAlexaLookAlbum,
-        name: generateUniqueOutputName(),
+        name: outputName,
       );
+      // Also write the same bytes to a temp file so the results screen can
+      // offer Share (share_plus needs a real file path, not just in-memory
+      // bytes) — deleted when that screen is dismissed, see
+      // ResultsSession.dispose.
+      final tempDir = await getTemporaryDirectory();
+      final tempPath = '${tempDir.path}/$outputName.jpg';
+      await File(tempPath).writeAsBytes(result.gradedBytes, flush: true);
       if (!mounted) return;
       HapticFeedback.mediumImpact();
       setState(() => _stage = _Stage.ready);
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Saved to $kAlexaLookAlbum album')),
+      await Navigator.of(context).push(
+        AppTheme.route(
+          ResultsScreen(
+            items: [
+              ExportedItem(
+                id: outputName,
+                kind: ExportedKind.photo,
+                tempFilePath: tempPath,
+                previewBytes: result.gradedBytes,
+              ),
+            ],
+          ),
+        ),
       );
     } catch (e) {
       if (!mounted) return;

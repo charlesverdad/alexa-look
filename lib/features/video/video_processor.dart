@@ -115,27 +115,62 @@ class VideoAttemptOutcome {
         log = null;
 }
 
+/// A cancellation flag shared between a caller and an in-flight
+/// [gradeVideoToTempFile] call.
+///
+/// Unlike targeting a specific ffmpeg session id (which only stops whichever
+/// attempt happens to be running *right now*), this flag is checked before
+/// every ladder attempt starts and again right after each one finishes — so
+/// a cancellation requested while an attempt is finishing up (racing its own
+/// natural completion) or during the ffprobe/startup window before any
+/// ffmpeg session exists at all still reliably stops the ladder, instead of
+/// letting the next fallback attempt start, complete, and get saved. Create
+/// it *before* calling [gradeVideoToTempFile] (rather than waiting for the
+/// [VideoGradeSession] it eventually returns) so a cancel requested during
+/// that call's own internal awaits still takes effect — see
+/// `batch_screen.dart`'s `_activeCancellationToken`.
+class VideoCancellationToken {
+  bool _cancelled = false;
+
+  /// True once [cancel] has been called.
+  bool get isCancelled => _cancelled;
+
+  void cancel() => _cancelled = true;
+}
+
 /// The live session backing an in-flight [gradeVideoToTempFile] call. Since
 /// the compatibility ladder may run several ffmpeg sessions in sequence,
 /// there's no single fixed session id to expose — [cancel] always targets
-/// whichever attempt is currently running.
+/// whichever attempt is currently running, backed up by [cancelRequested]
+/// (see [VideoCancellationToken]) for the gaps between attempts.
 class VideoGradeSession {
   final int? Function() _currentSessionId;
+  final VideoCancellationToken _cancellationToken;
   final Future<VideoGradeResult> result;
 
   // The public constructor param is intentionally named differently from
   // the private field it fills, so an initializing formal doesn't apply.
   const VideoGradeSession({
     required int? Function() currentSessionId,
+    required VideoCancellationToken cancellationToken,
     required this.result,
-    // ignore: prefer_initializing_formals
-  }) : _currentSessionId = currentSessionId;
+  })  : _currentSessionId = currentSessionId, // ignore: prefer_initializing_formals
+        _cancellationToken = cancellationToken; // ignore: prefer_initializing_formals
 
   /// The ffmpeg session id currently in flight, if any.
   int? get sessionId => _currentSessionId();
 
-  /// Cancels whichever encode attempt is currently running.
+  /// True once [cancel] has been called on this session (or on the
+  /// [VideoCancellationToken] it was built from). Persists across ladder
+  /// attempts, unlike [sessionId].
+  bool get cancelRequested => _cancellationToken.isCancelled;
+
+  /// Cancels whichever encode attempt is currently running, and marks this
+  /// session's [cancelRequested] so no further ladder attempt starts even if
+  /// none is running right now (e.g. between attempts, or before the first
+  /// one has started).
   void cancel() {
+    _cancellationToken.cancel();
     final id = _currentSessionId();
     if (id != null) {
       FFmpegKit.cancel(id);
@@ -272,6 +307,37 @@ List<VideoEncodeAttempt> buildVideoEncodeAttempts({
   return attempts;
 }
 
+/// Checked immediately before a ladder attempt would start its ffmpeg
+/// session: if [token] was already cancelled (e.g. during ffprobe/startup,
+/// or in the gap after a previous attempt finished but before the next one
+/// began), returns the cancelled outcome the attempt should resolve to
+/// *without* ever calling ffmpeg; returns `null` when it's fine to proceed.
+VideoAttemptOutcome? attemptOutcomeIfAlreadyCancelled(VideoCancellationToken token) {
+  return token.isCancelled ? const VideoAttemptOutcome.cancelled() : null;
+}
+
+/// Decides what outcome a finished ffmpeg attempt should report, given both
+/// what ffmpeg itself said ([ffmpegSuccess]/[ffmpegCancelled]) *and* whether
+/// [token] has been cancelled by the time the attempt completed.
+///
+/// A cancellation always wins over ffmpeg's own report: an attempt can
+/// finish (successfully, or with an unrelated natural failure) at almost the
+/// same moment [VideoGradeSession.cancel] is called, before
+/// `FFmpegKit.cancel` has any effect — without this check, that race would
+/// let the ladder treat the attempt as a genuine success/failure and either
+/// save a cancelled result or fall through to the next fallback attempt.
+VideoAttemptOutcome resolveAttemptOutcome({
+  required VideoCancellationToken token,
+  required bool ffmpegSuccess,
+  required bool ffmpegCancelled,
+  String? failureLog,
+}) {
+  if (token.isCancelled) return const VideoAttemptOutcome.cancelled();
+  if (ffmpegSuccess) return const VideoAttemptOutcome.success();
+  if (ffmpegCancelled) return const VideoAttemptOutcome.cancelled();
+  return VideoAttemptOutcome.failure(failureLog);
+}
+
 /// Runs [attempts] in order via [runAttempt], returning the encoder of the
 /// first one that succeeds. If every attempt fails, throws a
 /// [VideoGradeException] carrying the last attempt's log output. If an
@@ -322,7 +388,14 @@ Future<VideoGradeSession> gradeVideoToTempFile({
   required String inputPath,
   required String lutPath,
   void Function(double progress)? onProgress,
+  // Pass a token created *before* calling this function (rather than relying
+  // solely on the VideoGradeSession returned once the first attempt has
+  // started) so a cancellation requested during ffprobe/startup — before
+  // there's any ffmpeg session to target — still takes effect. See
+  // [VideoCancellationToken].
+  VideoCancellationToken? cancellationToken,
 }) async {
+  final token = cancellationToken ?? VideoCancellationToken();
   final tempDir = await getTemporaryDirectory();
   final outputPath = '${tempDir.path}/${generateUniqueOutputName()}.mp4';
 
@@ -367,26 +440,34 @@ Future<VideoGradeSession> gradeVideoToTempFile({
   final resultCompleter = Completer<VideoGradeResult>();
 
   Future<VideoAttemptOutcome> runAttempt(VideoEncodeAttempt attempt) {
+    // Checked before this attempt's ffmpeg session is even started — covers
+    // a cancellation requested during ffprobe/startup (before the first
+    // attempt) or in the gap after a previous attempt finished but before
+    // this one began.
+    final preCancelled = attemptOutcomeIfAlreadyCancelled(token);
+    if (preCancelled != null) return Future.value(preCancelled);
+
     final outcomeCompleter = Completer<VideoAttemptOutcome>();
     FFmpegKit.executeAsync(
       attempt.command,
       (completedSession) async {
         final returnCode = await completedSession.getReturnCode();
-        if (ReturnCode.isSuccess(returnCode)) {
-          outcomeCompleter.complete(const VideoAttemptOutcome.success());
-        } else if (ReturnCode.isCancel(returnCode)) {
-          // FFmpegKit.cancel() (via VideoGradeSession.cancel) makes the
-          // session return this code — it is not a failure, and must not be
-          // treated like one: runVideoEncodeLadder aborts the whole ladder
-          // on a cancelled outcome instead of falling through to the next
-          // fallback encode.
-          outcomeCompleter.complete(const VideoAttemptOutcome.cancelled());
-        } else {
-          final logs = await completedSession.getOutput();
-          outcomeCompleter.complete(
-            VideoAttemptOutcome.failure('ffmpeg failed (code $returnCode).\n${logs ?? ''}'),
-          );
-        }
+        final logs = ReturnCode.isSuccess(returnCode) || ReturnCode.isCancel(returnCode)
+            ? null
+            : await completedSession.getOutput();
+        // resolveAttemptOutcome re-checks `token` here too (not just above)
+        // — see its doc comment for the completion-race this covers, e.g.
+        // FFmpegKit.cancel() (via VideoGradeSession.cancel) making the
+        // session return ReturnCode.isCancel is not a failure and must not
+        // be treated like one: runVideoEncodeLadder aborts the whole ladder
+        // on a cancelled outcome instead of falling through to the next
+        // fallback encode.
+        outcomeCompleter.complete(resolveAttemptOutcome(
+          token: token,
+          ffmpegSuccess: ReturnCode.isSuccess(returnCode),
+          ffmpegCancelled: ReturnCode.isCancel(returnCode),
+          failureLog: logs == null ? null : 'ffmpeg failed (code $returnCode).\n$logs',
+        ));
       },
       null,
       (Statistics stats) {
@@ -431,6 +512,7 @@ Future<VideoGradeSession> gradeVideoToTempFile({
 
   return VideoGradeSession(
     currentSessionId: () => currentSessionId,
+    cancellationToken: token,
     result: resultCompleter.future,
   );
 }

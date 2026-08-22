@@ -29,6 +29,7 @@ typedef BatchItemProcessor = Future<void> Function(
 class BatchController extends ChangeNotifier {
   final List<BatchItem> items;
   final BatchItemProcessor processPhoto;
+  final BatchItemProcessor processRaw;
   final BatchItemProcessor processVideo;
 
   bool isRunning = false;
@@ -37,6 +38,7 @@ class BatchController extends ChangeNotifier {
   BatchController({
     required this.items,
     required this.processPhoto,
+    required this.processRaw,
     required this.processVideo,
   });
 
@@ -78,7 +80,15 @@ class BatchController extends ChangeNotifier {
       notifyListeners();
 
       try {
-        final processor = item.type == BatchMediaType.photo ? processPhoto : processVideo;
+        final processor = switch (item.type) {
+          BatchMediaType.photo => processPhoto,
+          BatchMediaType.raw => processRaw,
+          BatchMediaType.video => processVideo,
+          BatchMediaType.unsupported => throw StateError(
+              'BatchController received an unsupported item; unsupported '
+              'items must be filtered out before a batch run is built.',
+            ),
+        };
         await processor(item, intensity, (p) {
           item.progress = p;
           notifyListeners();

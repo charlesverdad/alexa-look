@@ -6,8 +6,18 @@ generated entirely from published, generic camera color-science constants.
 
 ## What it does
 
-- Pick a single photo or video, or select multiple items at once for a
-  batch run.
+- One home-screen action, **Select media**: pick any mix of photos, RAW/DNG
+  files, and videos from the gallery in a single multi-select. A **Browse
+  files…** action covers anything the gallery picker can't surface (RAW/DNG,
+  most notably). What each file actually *is* — photo, RAW, or video — is
+  detected from its own content (magic bytes), not from which picker
+  produced it or its file extension — see "Unified media selection" below.
+- Pick exactly one file and it opens straight into the matching single-item
+  editor (photo, RAW, or video); pick several (any mix) and they open in one
+  unified batch screen, RAW included.
+- **Share a photo or video into the app** from your gallery or another app
+  (Android) and it's routed through that exact same logic — see "Share to
+  app" below.
 - Import a RAW/DNG photo (including a phone's Pro-mode/UltraRAW capture) and
   grade it through the same pipeline — see "RAW (DNG) photo support" below.
 - The app applies a soft, desaturated, film-print-style grade: gentle shadow
@@ -16,6 +26,47 @@ generated entirely from published, generic camera color-science constants.
 - Adjust the strength of the effect with a **live-updating** intensity
   slider (photos), press-and-hold (or the Before/After toggle) to compare,
   and save the result — never overwriting your originals.
+- After saving, a **results screen** shows what was exported this session as
+  a thumbnail grid — tap a photo for a full-screen zoomable preview, tap a
+  video to share/open it, and Share (per item, or all at once) via the
+  system share sheet. "Saved to Alexa Look album" stays as the permanent
+  record regardless of what you do with Share.
+
+## Unified media selection
+
+Every picked/shared file — whatever picker or app it came from — is
+classified by its own **content**, not its extension or source, before
+anything happens with it (`lib/core/media_detector.dart`): JPEG, PNG,
+HEIC/HEIF, WebP and TIFF magic bytes, TIFF vs. DNG (by walking the TIFF IFD0
+for the `DNGVersion` tag — reusing the IFD parser in
+`lib/core/dng_preview.dart`), and MP4/MOV, Matroska/WebM, and AVI container
+signatures. A file's extension is only ever consulted as a fallback, when
+content sniffing is inconclusive.
+
+That classification feeds a small, pure routing decision
+(`lib/core/media_routing.dart`): exactly one supported file opens straight
+into its single-item editor (a RAW file goes through the same RAW decode
+chain either way); more than one — any mix of photo, RAW, and video — opens
+the unified batch screen, which now handles RAW items too (previously batch
+had no RAW path). Anything unrecognized is reported per-file without
+blocking the rest of the selection.
+
+## Share to app (Android)
+
+Alexa Look registers as a share target for images and videos
+(`ACTION_SEND`/`ACTION_SEND_MULTIPLE`, `image/*` and `video/*`, plus
+`application/octet-stream` for galleries that share a DNG under that generic
+mime type) via `receive_sharing_intent`. Files shared in — whether the app
+was already open or launched fresh by the share — flow through the exact
+same content-classification-and-routing logic as the in-app pickers. This is
+**Android-only** for now; an iOS share extension is out of scope for this
+release.
+
+Processing continues only while the app is open — there is no background
+service keeping a batch run alive if you switch away mid-run. A wakelock is
+held for the duration of a batch run so the screen itself doesn't sleep and
+interrupt it, but backgrounding the app (or the OS killing it) still stops
+processing; whatever had already finished and saved stays saved.
 
 ## Saving: dedicated album, never overwrite
 
@@ -133,25 +184,30 @@ save confirmation shows which encoder actually produced the file (e.g. "H.264
 
 ## Batch mode
 
-Selecting more than one item from **Batch** on the home screen (via
-`image_picker`'s `pickMultipleMedia()`) opens a grid of thumbnails with
-per-item status (queued / processing with progress / done / failed) and one
-shared intensity slider. Tapping **"Apply look & save all"** processes
-everything in order — photos through the multicore pipeline, videos
-sequentially through ffmpeg — saving each into the Alexa Look album as it
-finishes. The run is cancellable between items (the item in flight is
-allowed to finish, so nothing is left half-saved); anything already saved
-stays saved even if you cancel or back out. Picking exactly one item routes
-into the same single-item editor as the dedicated Photo/Video flows, for the
-richer per-item editing experience.
+Selecting more than one supported item from **Select media** (or **Browse
+files…**, or a share-in — see "Unified media selection" above) opens a grid
+of thumbnails with per-item status (queued / processing with progress / done
+/ failed) and one shared intensity slider. Tapping
+**"Apply look & save all"** processes everything in order — photos and RAW
+files through the multicore pipeline (RAW decoded first via the same
+fallback chain as the single-item RAW import, below), videos sequentially
+through ffmpeg — saving each into the Alexa Look album as it finishes. The
+run is cancellable between items (the item in flight is allowed to finish,
+so nothing is left half-saved); anything already saved stays saved even if
+you cancel or back out. Once the run finishes, the results screen (see
+above) shows a grid of everything that was exported. Picking exactly one
+item routes into the richer single-item editor instead of the batch grid.
 
 ## RAW (DNG) photo support
 
-**Import RAW** on the home screen lets you grade an Adobe DNG raw photo —
-including a phone's Pro-mode/UltraRAW capture — through the same look
-pipeline as any other photo. Tested against the **Xiaomi 15 Ultra**'s
-Pro-mode RAW and UltraRAW DNGs, but works with standard DNG files from any
-source.
+Picking (or sharing in) a single DNG raw photo — including a phone's
+Pro-mode/UltraRAW capture — opens the same single-photo editor, routed there
+automatically because the file's own bytes were recognized as DNG (see
+"Unified media selection" above); a "Browse files…" pick still works too,
+since a DNG usually can't be surfaced by the gallery picker in the first
+place. Either way it's graded through the same look pipeline as any other
+photo. Tested against the **Xiaomi 15 Ultra**'s Pro-mode RAW and UltraRAW
+DNGs, but works with standard DNG files from any source.
 
 ### How it decodes a RAW file
 
@@ -254,6 +310,11 @@ public documentation any colorist uses to build a custom look) purely to
 build its own original color transform — no ARRI software, LUTs, or other
 copyrighted assets are used or distributed.
 
+This same notice, plus the app version and a link to the open-source
+licenses page, is shown in-app behind the version number at the bottom of
+the home screen (the About sheet) — kept there rather than as permanent
+home-screen text, to keep the home screen itself uncluttered.
+
 ## Building
 
 Requires the Flutter SDK (this project targets Flutter 3.47+ / Dart 3.13+).
@@ -300,9 +361,30 @@ The suite covers:
   generated at the same instant.
 - `BatchController`'s pure state-machine logic: queued → processing → done
   transitions, failure isolation (one failed item doesn't stop the rest),
-  and cancellation taking effect between items.
-- A widget smoke test asserting the home screen renders its Photo and Video
-  actions.
+  cancellation taking effect between items, and routing a RAW item through
+  its own `processRaw` callback rather than the photo/video ones.
+- The batch flow's RAW-item pipeline (`gradeRawBatchItem`) with an injected
+  fake byte reader and decode step: read → decode → prepare → grade →
+  encode wiring, monotonic progress reporting, and a decode failure
+  propagating rather than being swallowed.
+- The content-based media classifier (`classifyMediaBytes`) against
+  synthetic byte fixtures for every format branch (JPEG, PNG, HEIC/HEIF,
+  WebP, TIFF, DNG, MP4, MOV, Matroska/WebM, AVI), TIFF-vs-DNG discrimination
+  via the `DNGVersion` IFD0 tag, and the extension fallback (case-insensitive,
+  and only used when content sniffing is inconclusive — recognized content
+  always wins over a misleading extension).
+- The pure routing decision (`decideMediaRoute`) with injected fakes: one
+  supported item → its single-item editor (photo, RAW, or video), several
+  (any mix) → the unified batch screen, unsupported files filtered out and
+  reported without blocking the rest, and an all-unsupported or empty
+  selection routing nowhere.
+- The results screen's non-widget model (`ResultsSession`): items/their temp
+  files usable until `dispose`, "share all" gathering every item's path,
+  `dispose` being idempotent, and a per-item delete failure not blocking the
+  rest's cleanup.
+- A widget smoke test asserting the home screen renders the unified
+  "Select media" / "Browse files…" actions (and not the old four
+  Photo/Video/Batch/RAW buttons or the "Licenses" link).
 - The RAW/DNG embedded-preview parser (`extractLargestDngPreviewJpeg`)
   against hand-crafted TIFF/IFD byte structures: `JpegIFOffset` previews,
   single-strip JPEG-compressed-IFD previews, SubIFD traversal, picking the
@@ -338,12 +420,15 @@ synthetic DNG) before this was merged.
 ```
 lib/
   core/            Pure-Dart color science, .cube parser, LUT generation/apply, LUT asset loading,
-                   output naming, RAW decode (dart:ffi bindings, DNG preview parser, fallback chain)
+                   output naming, RAW decode (dart:ffi bindings, DNG preview parser, fallback chain),
+                   content-based media classification + routing (media_detector.dart, media_routing.dart)
   features/
-    home/          Home screen (Photo / Video / Batch / RAW entry points)
+    home/          Home screen (unified "Select media" + "Browse files…", share-intent handling,
+                   the About sheet tucked behind the version number)
     photo/         Photo picking, multicore grading, live preview, save
     video/         Video picking, ffmpeg-based grading, progress, save
-    batch/         Multi-select batch flow: models, state-machine controller, grid UI
+    batch/         Multi-select batch flow: models, state-machine controller, grid UI, RAW-item processing
+    results/       Results screen shown after a save: thumbnail grid, full-screen preview, share
   theme/           App-wide dark theme, page transitions
 native/
   CMakeLists.txt   Builds libcamraw.so (vendored LibRaw + the camraw wrapper) for Android

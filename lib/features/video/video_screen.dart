@@ -8,6 +8,8 @@ import 'package:image_picker/image_picker.dart';
 import '../../core/lut_asset.dart';
 import '../../core/output_naming.dart';
 import '../../theme/app_theme.dart';
+import '../results/exported_item.dart';
+import '../results/results_screen.dart';
 import 'video_processor.dart';
 
 enum _Stage { picking, preparing, processing, done, error }
@@ -33,6 +35,20 @@ class _VideoScreenState extends State<VideoScreen> {
   VideoEncoder? _encoderUsed;
   VideoGradeSession? _gradeSession;
 
+  /// Created before any of [_process]'s awaits, same reasoning as
+  /// `BatchScreen._activeCancellationToken`: it exists (and so can be
+  /// cancelled) even while grading is still in ffprobe/startup, before
+  /// [_gradeSession] itself has been assigned.
+  VideoCancellationToken? _cancellationToken;
+
+  /// True once this screen's [Gal.putVideo] save has succeeded. The temp
+  /// mp4 [_outputPath] points at is only guaranteed to exist until the
+  /// results screen pushed from [_save] is dismissed (see
+  /// `ResultsSession.dispose`), so a second tap of Save after that would
+  /// fail with nothing to recover — this instead disables Save once it's
+  /// already succeeded, see [_DoneView].
+  bool _saved = false;
+
   @override
   void initState() {
     super.initState();
@@ -41,6 +57,7 @@ class _VideoScreenState extends State<VideoScreen> {
 
   @override
   void dispose() {
+    _cancellationToken?.cancel();
     _gradeSession?.cancel();
     super.dispose();
   }
@@ -70,6 +87,8 @@ class _VideoScreenState extends State<VideoScreen> {
 
   Future<void> _process(String inputPath) async {
     try {
+      final token = VideoCancellationToken();
+      _cancellationToken = token;
       final lutFile = await ensureAlexaLookLutFile();
 
       if (!mounted) return;
@@ -78,6 +97,7 @@ class _VideoScreenState extends State<VideoScreen> {
       final session = await gradeVideoToTempFile(
         inputPath: inputPath,
         lutPath: lutFile.path,
+        cancellationToken: token,
         onProgress: (fraction) {
           if (!mounted) return;
           setState(() => _progress = fraction);
@@ -109,20 +129,33 @@ class _VideoScreenState extends State<VideoScreen> {
 
   Future<void> _save() async {
     final path = _outputPath;
-    if (path == null) return;
-    var didSave = false;
+    // Already saved once — the temp file at `path` only survives until the
+    // results screen pushed below is dismissed (ResultsSession.dispose
+    // deletes it), so a second Save tap after that would have nothing left
+    // to copy. The Save button is disabled once _saved is true (see
+    // VideoDoneView), so this is just defense in depth.
+    if (path == null || _saved) return;
     try {
       await Gal.putVideo(path, album: kAlexaLookAlbum);
-      didSave = true;
       if (!mounted) return;
+      setState(() => _saved = true);
       HapticFeedback.mediumImpact();
-      final encoderLabel = _encoderUsed?.label;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            encoderLabel == null
-                ? 'Saved to $kAlexaLookAlbum album'
-                : 'Saved to $kAlexaLookAlbum album · $encoderLabel',
+      // The graded mp4 already lives in the temp dir — keep it there
+      // (rather than deleting it now that it's copied into the gallery) so
+      // the results screen can still offer Share while it's open. It's
+      // deleted when that screen is dismissed instead, see
+      // ResultsSession.dispose.
+      await Navigator.of(context).push(
+        AppTheme.route(
+          ResultsScreen(
+            items: [
+              ExportedItem(
+                id: generateUniqueOutputName(),
+                kind: ExportedKind.video,
+                tempFilePath: path,
+              ),
+            ],
+            summary: _encoderUsed == null ? null : 'Encoded with ${_encoderUsed!.label}',
           ),
         ),
       );
@@ -131,13 +164,6 @@ class _VideoScreenState extends State<VideoScreen> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Could not save: $e')),
       );
-    } finally {
-      // The graded mp4 lives in the temp dir and is only needed until it's
-      // been copied into the gallery — clean it up now so temp output
-      // doesn't accumulate on disk.
-      if (didSave) {
-        await deleteTempVideoBestEffort(path);
-      }
     }
   }
 
@@ -150,7 +176,7 @@ class _VideoScreenState extends State<VideoScreen> {
           _Stage.picking => const _StatusView(label: 'Opening picker…'),
           _Stage.preparing => const _StatusView(label: 'Preparing…'),
           _Stage.processing => _ProgressView(progress: _progress),
-          _Stage.done => _DoneView(onSave: _save),
+          _Stage.done => VideoDoneView(onSave: _save, saved: _saved),
           _Stage.error => _ErrorView(message: _errorMessage ?? 'Something went wrong.'),
         },
       ),
@@ -205,9 +231,16 @@ class _ProgressView extends StatelessWidget {
   }
 }
 
-class _DoneView extends StatelessWidget {
+/// The "done" stage's body: a Save button that becomes a disabled "Saved"
+/// state once [saved] is true, rather than staying tappable and failing the
+/// second time (see `_VideoScreenState._save`, which is the only real
+/// caller — this is a top-level, non-private widget purely so it can be
+/// pumped directly in widget tests without needing to drive the whole
+/// picker/ffmpeg flow that gets a `VideoScreen` into this stage).
+class VideoDoneView extends StatelessWidget {
   final VoidCallback onSave;
-  const _DoneView({required this.onSave});
+  final bool saved;
+  const VideoDoneView({super.key, required this.onSave, this.saved = false});
 
   @override
   Widget build(BuildContext context) {
@@ -219,9 +252,9 @@ class _DoneView extends StatelessWidget {
         const Text('Your graded video is ready.'),
         const SizedBox(height: 24),
         ElevatedButton.icon(
-          onPressed: onSave,
-          icon: const Icon(Icons.download_outlined),
-          label: const Text('Save to gallery'),
+          onPressed: saved ? null : onSave,
+          icon: Icon(saved ? Icons.check : Icons.download_outlined),
+          label: Text(saved ? 'Saved to gallery' : 'Save to gallery'),
         ),
       ],
     );

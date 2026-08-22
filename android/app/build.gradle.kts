@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "dev.charlesverdad.alexa_look"
-    compileSdk = flutter.compileSdkVersion
+    compileSdk = 37
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
