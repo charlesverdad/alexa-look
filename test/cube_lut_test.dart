@@ -1,5 +1,9 @@
+import 'dart:math';
+import 'dart:typed_data';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:alexa_look/core/cube_lut.dart';
+import 'package:alexa_look/core/lut_generation.dart';
 
 /// Builds a tiny, hand-written identity LUT of the given [size], so
 /// `lut.apply(r,g,b) == (r,g,b)` for any lattice point.
@@ -162,6 +166,68 @@ LUT_3D_SIZE 2
       expect(c.r, closeTo(0.0, 1e-9));
       expect(c.g, closeTo(1.0, 1e-9));
       expect(c.b, closeTo(0.5, 1e-9));
+    });
+  });
+
+  group('applyLutToRgbaBand (optimized bulk path)', () {
+    test('matches CubeLut.apply within 1 LSB across random pixels for a '
+        'non-trivial LUT', () {
+      // Use the real Alexa Look curve (not an identity LUT) so the
+      // comparison exercises genuinely non-linear trilinear interpolation,
+      // not just a pass-through.
+      final lut = CubeLut.parse(generateAlexaLookCubeText(size: 17));
+      final lattice = lut.toFloat32Lattice();
+
+      final random = Random(42);
+      const pixelCount = 500;
+      final rgba = Uint8List(pixelCount * 4);
+      for (var i = 0; i < pixelCount; i++) {
+        final base = i * 4;
+        rgba[base] = random.nextInt(256);
+        rgba[base + 1] = random.nextInt(256);
+        rgba[base + 2] = random.nextInt(256);
+        rgba[base + 3] = 255;
+      }
+      final reference = Uint8List.fromList(rgba);
+
+      for (final intensity in [0.0, 0.35, 1.0]) {
+        final bulk = Uint8List.fromList(rgba);
+        CubeLut.applyLutToRgbaBand(
+          bulk,
+          lattice: lattice,
+          lutSize: lut.size,
+          domainMin: lut.domainMin,
+          domainMax: lut.domainMax,
+          intensity: intensity,
+        );
+
+        for (var i = 0; i < pixelCount; i++) {
+          final base = i * 4;
+          final r0 = reference[base] / 255.0;
+          final g0 = reference[base + 1] / 255.0;
+          final b0 = reference[base + 2] / 255.0;
+          final graded = lut.apply(r0, g0, b0);
+          final expectedR = (r0 + (graded.r - r0) * intensity).clamp(0.0, 1.0);
+          final expectedG = (g0 + (graded.g - g0) * intensity).clamp(0.0, 1.0);
+          final expectedB = (b0 + (graded.b - b0) * intensity).clamp(0.0, 1.0);
+
+          expect(bulk[base], closeTo(expectedR * 255.0, 1.0));
+          expect(bulk[base + 1], closeTo(expectedG * 255.0, 1.0));
+          expect(bulk[base + 2], closeTo(expectedB * 255.0, 1.0));
+          // Alpha is untouched.
+          expect(bulk[base + 3], 255);
+        }
+      }
+    });
+
+    test('toFloat32Lattice round-trips the same values apply() samples', () {
+      final lut = CubeLut.parse(_identityCube(3));
+      final lattice = lut.toFloat32Lattice();
+      expect(lattice.length, 3 * 3 * 3 * 3);
+      // First lattice point (r=0,g=0,b=0) should be black.
+      expect(lattice[0], closeTo(0.0, 1e-6));
+      expect(lattice[1], closeTo(0.0, 1e-6));
+      expect(lattice[2], closeTo(0.0, 1e-6));
     });
   });
 }

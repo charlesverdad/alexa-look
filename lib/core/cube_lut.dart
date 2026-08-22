@@ -212,4 +212,169 @@ class CubeLut {
       bytes[base + 2] = (b.clamp(0.0, 1.0) * 255.0).round();
     }
   }
+
+  /// Flattens the lattice data to a [Float32List] in the same `[b][g][r][ch]`
+  /// order as the internal storage, for cheap, compact cross-isolate
+  /// messaging (a flat typed-data buffer instead of re-sending/re-parsing
+  /// the original `.cube` text on every band).
+  Float32List toFloat32Lattice() => Float32List.fromList(_data);
+
+  /// Applies a LUT — already flattened via [toFloat32Lattice] — to a buffer
+  /// of interleaved RGBA bytes **in place**, blending toward the original
+  /// pixel by [intensity] (0.0 = no change, 1.0 = fully graded). Alpha is
+  /// left untouched.
+  ///
+  /// This is the optimized bulk-application path used by the photo grading
+  /// pipeline: a single tight loop over the byte buffer with precomputed
+  /// scale factors, no [Color3] allocation and no per-pixel function calls
+  /// (the trilinear math is written out inline). It is numerically
+  /// equivalent (within 1/255 rounding) to calling [apply] pixel-by-pixel
+  /// via [applyToRgbBytes], just much faster and allocation-free.
+  ///
+  /// [rgba] length must be a multiple of 4. [lattice] must be `size^3 * 3`
+  /// values long, in the same ordering [toFloat32Lattice] produces.
+  static void applyLutToRgbaBand(
+    Uint8List rgba, {
+    required Float32List lattice,
+    required int lutSize,
+    required Color3 domainMin,
+    required Color3 domainMax,
+    double intensity = 1.0,
+  }) {
+    final n = lutSize - 1;
+    if (n <= 0) {
+      throw ArgumentError.value(lutSize, 'lutSize', 'must be >= 2');
+    }
+
+    // Fold "normalize to [0,1] over the domain, then scale by n" into a
+    // single multiply-add per channel: fr = (r - domainMin.r) * scaleR.
+    final rangeR = domainMax.r - domainMin.r;
+    final rangeG = domainMax.g - domainMin.g;
+    final rangeB = domainMax.b - domainMin.b;
+    final scaleR = rangeR <= 0 ? 0.0 : n / rangeR;
+    final scaleG = rangeG <= 0 ? 0.0 : n / rangeG;
+    final scaleB = rangeB <= 0 ? 0.0 : n / rangeB;
+    final minR = domainMin.r, minG = domainMin.g, minB = domainMin.b;
+
+    final sizeSq3 = lutSize * lutSize * 3;
+    final size3 = lutSize * 3;
+
+    final clampedIntensity = intensity.clamp(0.0, 1.0);
+    final nD = n.toDouble();
+    final pixelCount = rgba.length ~/ 4;
+
+    for (var i = 0; i < pixelCount; i++) {
+      final base = i * 4;
+      final r0 = rgba[base] / 255.0;
+      final g0 = rgba[base + 1] / 255.0;
+      final b0 = rgba[base + 2] / 255.0;
+
+      var fr = (r0 - minR) * scaleR;
+      if (fr < 0) {
+        fr = 0;
+      } else if (fr > nD) {
+        fr = nD;
+      }
+      var fg = (g0 - minG) * scaleG;
+      if (fg < 0) {
+        fg = 0;
+      } else if (fg > nD) {
+        fg = nD;
+      }
+      var fb = (b0 - minB) * scaleB;
+      if (fb < 0) {
+        fb = 0;
+      } else if (fb > nD) {
+        fb = nD;
+      }
+
+      final ir0 = fr.toInt();
+      final ig0 = fg.toInt();
+      final ib0 = fb.toInt();
+      final ir1 = ir0 < n ? ir0 + 1 : ir0;
+      final ig1 = ig0 < n ? ig0 + 1 : ig0;
+      final ib1 = ib0 < n ? ib0 + 1 : ib0;
+
+      final tr = fr - ir0;
+      final tg = fg - ig0;
+      final tb = fb - ib0;
+
+      final ib0Base = ib0 * sizeSq3;
+      final ib1Base = ib1 * sizeSq3;
+      final ig0Base = ig0 * size3;
+      final ig1Base = ig1 * size3;
+      final ir0Base = ir0 * 3;
+      final ir1Base = ir1 * 3;
+
+      final c000 = ib0Base + ig0Base + ir0Base;
+      final c100 = ib0Base + ig0Base + ir1Base;
+      final c010 = ib0Base + ig1Base + ir0Base;
+      final c110 = ib0Base + ig1Base + ir1Base;
+      final c001 = ib1Base + ig0Base + ir0Base;
+      final c101 = ib1Base + ig0Base + ir1Base;
+      final c011 = ib1Base + ig1Base + ir0Base;
+      final c111 = ib1Base + ig1Base + ir1Base;
+
+      final omtr = 1 - tr;
+      final omtg = 1 - tg;
+      final omtb = 1 - tb;
+      final w000 = omtr * omtg * omtb;
+      final w100 = tr * omtg * omtb;
+      final w010 = omtr * tg * omtb;
+      final w110 = tr * tg * omtb;
+      final w001 = omtr * omtg * tb;
+      final w101 = tr * omtg * tb;
+      final w011 = omtr * tg * tb;
+      final w111 = tr * tg * tb;
+
+      final gradedR = lattice[c000] * w000 +
+          lattice[c100] * w100 +
+          lattice[c010] * w010 +
+          lattice[c110] * w110 +
+          lattice[c001] * w001 +
+          lattice[c101] * w101 +
+          lattice[c011] * w011 +
+          lattice[c111] * w111;
+      final gradedG = lattice[c000 + 1] * w000 +
+          lattice[c100 + 1] * w100 +
+          lattice[c010 + 1] * w010 +
+          lattice[c110 + 1] * w110 +
+          lattice[c001 + 1] * w001 +
+          lattice[c101 + 1] * w101 +
+          lattice[c011 + 1] * w011 +
+          lattice[c111 + 1] * w111;
+      final gradedB = lattice[c000 + 2] * w000 +
+          lattice[c100 + 2] * w100 +
+          lattice[c010 + 2] * w010 +
+          lattice[c110 + 2] * w110 +
+          lattice[c001 + 2] * w001 +
+          lattice[c101 + 2] * w101 +
+          lattice[c011 + 2] * w011 +
+          lattice[c111 + 2] * w111;
+
+      var r = r0 + (gradedR - r0) * clampedIntensity;
+      var g = g0 + (gradedG - g0) * clampedIntensity;
+      var b = b0 + (gradedB - b0) * clampedIntensity;
+
+      if (r < 0) {
+        r = 0;
+      } else if (r > 1) {
+        r = 1;
+      }
+      if (g < 0) {
+        g = 0;
+      } else if (g > 1) {
+        g = 1;
+      }
+      if (b < 0) {
+        b = 0;
+      } else if (b > 1) {
+        b = 1;
+      }
+
+      rgba[base] = (r * 255.0).round();
+      rgba[base + 1] = (g * 255.0).round();
+      rgba[base + 2] = (b * 255.0).round();
+    }
+  }
 }

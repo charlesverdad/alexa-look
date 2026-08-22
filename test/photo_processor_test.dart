@@ -65,11 +65,15 @@ void main() {
         ),
       );
 
-      expect(prepared.width, 2);
-      expect(prepared.height, 2);
-      expect(prepared.rgbaBytes.length, 2 * 2 * 4);
+      expect(prepared.fullWidth, 2);
+      expect(prepared.fullHeight, 2);
+      expect(prepared.fullRgbaBytes.length, 2 * 2 * 4);
+      // The 2x2 source is well under the preview downscale cap, so the
+      // preview copy should be identical in size to the full one.
+      expect(prepared.previewWidth, 2);
+      expect(prepared.previewHeight, 2);
 
-      final decoded = _decodeRgba(prepared.rgbaBytes, 2, 2);
+      final decoded = _decodeRgba(prepared.fullRgbaBytes, 2, 2);
       final red = decoded.getPixel(0, 0);
       expect(red.r, closeTo(255, 1));
       expect(red.g, closeTo(0, 1));
@@ -94,10 +98,11 @@ void main() {
     test('bakes EXIF orientation even for images under the resize cap', () async {
       // A 2x1 image, physically red-then-green, tagged as EXIF orientation 6
       // (rotate 90 CW to display correctly) and small enough that the
-      // >3000px resize path (which used to be the only place orientation got
-      // baked) never runs. Encoded as TIFF, not PNG: this package's PNG
-      // codec doesn't round-trip EXIF data at all, so the test uses a format
-      // that actually carries the orientation tag through encode/decode.
+      // full-resolution resize-cap path (which used to be the only place
+      // orientation got baked) never runs. Encoded as TIFF, not PNG: this
+      // package's PNG codec doesn't round-trip EXIF data at all, so the test
+      // uses a format that actually carries the orientation tag through
+      // encode/decode.
       final source = img.Image(width: 2, height: 1);
       source.setPixelRgb(0, 0, 255, 0, 0); // red
       source.setPixelRgb(1, 0, 0, 255, 0); // green
@@ -113,9 +118,9 @@ void main() {
 
       // Orientation 6 rotates 90 degrees clockwise, so the 2x1 source
       // becomes 1x2, with the original left pixel (red) now on top.
-      expect(prepared.width, 1);
-      expect(prepared.height, 2);
-      final decoded = _decodeRgba(prepared.rgbaBytes, 1, 2);
+      expect(prepared.fullWidth, 1);
+      expect(prepared.fullHeight, 2);
+      final decoded = _decodeRgba(prepared.fullRgbaBytes, 1, 2);
       final top = decoded.getPixel(0, 0);
       expect(top.r, closeTo(255, 1));
       expect(top.g, closeTo(0, 1));
@@ -142,7 +147,7 @@ void main() {
       );
 
       final result = await gradeCachedPhoto(
-        PhotoRegradeRequest.from(prepared, 1.0),
+        PhotoRegradeRequest.full(prepared, 1.0),
       );
       expect(result.width, 2);
       expect(result.height, 2);
@@ -151,18 +156,38 @@ void main() {
       // Grading again from the same PreparedPhoto at a different intensity
       // must not be affected by the previous call mutating shared state.
       final result2 = await gradeCachedPhoto(
-        PhotoRegradeRequest.from(prepared, 0.0),
+        PhotoRegradeRequest.full(prepared, 0.0),
       );
       expect(result2.width, 2);
       expect(result2.height, 2);
 
       // With an identity LUT, a 0.0-intensity regrade should still decode to
-      // the original source colors.
-      final decoded = img.decodePng(result2.gradedBytes)!;
+      // (approximately, allowing for JPEG's lossy compression) the original
+      // source colors.
+      final decoded = img.decodeJpg(result2.gradedBytes)!;
       final p = decoded.getPixel(0, 0);
-      expect(p.r, closeTo(200, 1));
-      expect(p.g, closeTo(50, 1));
-      expect(p.b, closeTo(50, 1));
+      expect(p.r, closeTo(200, 8));
+      expect(p.g, closeTo(50, 8));
+      expect(p.b, closeTo(50, 8));
+    });
+
+    test('preview target grades the small preview buffer', () async {
+      final source = img.Image(width: 4, height: 4);
+      for (var y = 0; y < 4; y++) {
+        for (var x = 0; x < 4; x++) {
+          source.setPixelRgb(x, y, 100, 150, 200);
+        }
+      }
+      final pngBytes = Uint8List.fromList(img.encodePng(source));
+      final prepared = await preparePhoto(
+        PhotoPrepareRequest(originalBytes: pngBytes, cubeText: _identityCube(2)),
+      );
+
+      final preview = await gradeCachedPhoto(
+        PhotoRegradeRequest.preview(prepared, 1.0),
+      );
+      expect(preview.width, prepared.previewWidth);
+      expect(preview.height, prepared.previewHeight);
     });
   });
 }

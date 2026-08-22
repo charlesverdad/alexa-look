@@ -75,4 +75,35 @@ class AppTheme {
       ),
     );
   }
+
+  /// Pushes [page] with the app's smooth fade+scale transition. Every push
+  /// in the app goes through this helper (rather than relying on a
+  /// `pageTransitionsTheme` on the platform-default route builder), so this
+  /// is the single place that transition is defined.
+  static Route<T> route<T>(Widget page) {
+    return PageRouteBuilder<T>(
+      transitionDuration: const Duration(milliseconds: 260),
+      reverseTransitionDuration: const Duration(milliseconds: 200),
+      pageBuilder: (context, animation, secondaryAnimation) => page,
+      transitionsBuilder: _buildFadeScaleTransition,
+    );
+  }
+
+  /// The shared fade+scale transition: a gentle, cinematic effect (no hard
+  /// slide) used for every screen-to-screen navigation in the app.
+  static Widget _buildFadeScaleTransition(
+    BuildContext context,
+    Animation<double> animation,
+    Animation<double> secondaryAnimation,
+    Widget child,
+  ) {
+    final curved = CurvedAnimation(parent: animation, curve: Curves.easeOutCubic);
+    return FadeTransition(
+      opacity: curved,
+      child: ScaleTransition(
+        scale: Tween(begin: 0.98, end: 1.0).animate(curved),
+        child: child,
+      ),
+    );
+  }
 }

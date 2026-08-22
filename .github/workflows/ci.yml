@@ -30,6 +30,11 @@ jobs:
           dart run tool/generate_lut.dart
           git diff --exit-code -- assets/luts
 
+      - name: Verify generated app icon assets are up to date
+        run: |
+          dart run tool/generate_icon.dart
+          git diff --exit-code -- assets/icon
+
       - name: Analyze
         run: flutter analyze
 
