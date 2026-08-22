@@ -26,6 +26,7 @@
 library;
 
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:image/image.dart' as img;
@@ -105,20 +106,7 @@ double _barCoverage(_Bar bar, double x, double y) {
 }
 
 double _hypot(double a, double b) {
-  return _sqrt(a * a + b * b);
-}
-
-double _sqrt(double v) {
-  if (v <= 0) return 0;
-  // Standard Newton-Raphson sqrt — deterministic, avoids relying on
-  // dart:math for this tiny amount of logic (still fine either way; kept
-  // explicit for clarity of determinism).
-  var x = v;
-  var guess = v / 2 == 0 ? v : v / 2;
-  for (var i = 0; i < 24; i++) {
-    guess = 0.5 * (guess + x / guess);
-  }
-  return guess;
+  return math.sqrt(a * a + b * b);
 }
 
 /// Gradient color at horizontal position [x] (in canvas pixels), swept
@@ -160,7 +148,7 @@ Uint8List _renderMotif({required double barScale, required bool transparentBackg
   const cx = kIconSize / 2;
   const cy = kIconSize / 2;
   // Half-diagonal, for the vignette falloff.
-  final maxDist = _sqrt(cx * cx + cy * cy);
+  final maxDist = math.sqrt(cx * cx + cy * cy);
 
   for (var y = 0; y < kIconSize; y++) {
     final fy = y + 0.5;

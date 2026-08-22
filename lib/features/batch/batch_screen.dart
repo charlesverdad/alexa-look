@@ -68,7 +68,14 @@ class _BatchScreenState extends State<BatchScreen> {
     final bytes = await item.file.readAsBytes();
     onProgress(0.15);
     final prepared = await preparePhoto(
-      PhotoPrepareRequest(originalBytes: bytes, cubeText: cubeText),
+      PhotoPrepareRequest(
+        originalBytes: bytes,
+        cubeText: cubeText,
+        // Batch only ever grades the full-resolution buffer — there's no
+        // live slider preview here — so skip building the ~1200px preview
+        // copy nobody looks at.
+        buildPreview: false,
+      ),
     );
     onProgress(0.4);
     final result = await gradeCachedPhoto(
@@ -188,6 +195,9 @@ class _BatchScreenState extends State<BatchScreen> {
   Widget _buildControls() {
     final running = _controller.isRunning;
     final complete = _controller.isComplete;
+    final items = _controller.items;
+    final hasVideos = items.any((i) => i.type == BatchMediaType.video);
+    final videosOnly = items.isNotEmpty && items.every((i) => i.type == BatchMediaType.video);
     return Container(
       padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
       decoration: const BoxDecoration(
@@ -212,8 +222,21 @@ class _BatchScreenState extends State<BatchScreen> {
           ),
           Slider(
             value: _intensity,
-            onChanged: running ? null : (v) => setState(() => _intensity = v),
+            onChanged: running || videosOnly
+                ? null
+                : (v) => setState(() => _intensity = v),
           ),
+          if (hasVideos)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Text(
+                'Videos are always graded at 100%',
+                style: Theme.of(context)
+                    .textTheme
+                    .bodySmall
+                    ?.copyWith(color: AppTheme.textSecondary),
+              ),
+            ),
           const SizedBox(height: 8),
           ElevatedButton.icon(
             onPressed: running || complete ? null : _run,

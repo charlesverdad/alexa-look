@@ -38,9 +38,18 @@ class PhotoPrepareRequest {
   final Uint8List originalBytes;
   final String cubeText;
 
+  /// Whether to build the small [kMaxPreviewDimension] preview copy used
+  /// for the live intensity-slider preview. The single-photo editor needs
+  /// it (that's the whole point of the preview buffer); the batch flow
+  /// only ever grades [PhotoRegradeRequest.full] and never shows a live
+  /// slider preview, so it passes `false` to skip resizing/copying a
+  /// buffer nobody looks at. Defaults to `true`.
+  final bool buildPreview;
+
   const PhotoPrepareRequest({
     required this.originalBytes,
     required this.cubeText,
+    this.buildPreview = true,
   });
 }
 
@@ -61,7 +70,10 @@ class PreparedPhoto {
 
   /// A small downscaled copy of the same image (max
   /// [kMaxPreviewDimension] on its longest side), used for the live
-  /// intensity-slider preview so re-grading feels instant.
+  /// intensity-slider preview so re-grading feels instant. Empty (and
+  /// [previewWidth]/[previewHeight] zero) when the request was made with
+  /// `buildPreview: false`, e.g. from the batch flow, which never grades
+  /// this buffer.
   final Uint8List previewRgbaBytes;
   final int previewWidth;
   final int previewHeight;
@@ -204,17 +216,26 @@ PreparedPhoto _preparePhotoSync(PhotoPrepareRequest request) {
 
   final fullRgbaBytes = image.getBytes(order: img.ChannelOrder.rgba);
 
-  // Build the small preview copy used for the live slider regrade.
-  img.Image previewImage = image;
-  if (image.width > kMaxPreviewDimension || image.height > kMaxPreviewDimension) {
-    previewImage = img.copyResize(
-      image,
-      width: image.width >= image.height ? kMaxPreviewDimension : null,
-      height: image.height > image.width ? kMaxPreviewDimension : null,
-      interpolation: img.Interpolation.average,
-    );
+  // Build the small preview copy used for the live slider regrade — unless
+  // the caller (batch flow) said it will never grade a preview, in which
+  // case skip the resize and the extra RGBA buffer copy entirely.
+  var previewRgbaBytes = Uint8List(0);
+  var previewWidth = 0;
+  var previewHeight = 0;
+  if (request.buildPreview) {
+    img.Image previewImage = image;
+    if (image.width > kMaxPreviewDimension || image.height > kMaxPreviewDimension) {
+      previewImage = img.copyResize(
+        image,
+        width: image.width >= image.height ? kMaxPreviewDimension : null,
+        height: image.height > image.width ? kMaxPreviewDimension : null,
+        interpolation: img.Interpolation.average,
+      );
+    }
+    previewRgbaBytes = previewImage.getBytes(order: img.ChannelOrder.rgba);
+    previewWidth = previewImage.width;
+    previewHeight = previewImage.height;
   }
-  final previewRgbaBytes = previewImage.getBytes(order: img.ChannelOrder.rgba);
 
   final lut = CubeLut.parse(request.cubeText);
 
@@ -223,8 +244,8 @@ PreparedPhoto _preparePhotoSync(PhotoPrepareRequest request) {
     fullWidth: image.width,
     fullHeight: image.height,
     previewRgbaBytes: previewRgbaBytes,
-    previewWidth: previewImage.width,
-    previewHeight: previewImage.height,
+    previewWidth: previewWidth,
+    previewHeight: previewHeight,
     lutLattice: lut.toFloat32Lattice(),
     lutSize: lut.size,
     lutDomainMin: lut.domainMin,
@@ -338,9 +359,22 @@ Future<Uint8List> gradeRgbaMulticore({
     if (rowsInBand == 0) continue;
     final startByte = startRow * bytesPerRow;
     final endByte = (startRow + rowsInBand) * bytesPerRow;
-    final bandBytes = Uint8List.sublistView(rgba, startByte, endByte);
+    // Materialize this band's bytes into their own buffer *before* handing
+    // them to Isolate.run. A plain sublistView is just a window onto the
+    // full image's backing ByteBuffer, and isolate messaging copies the
+    // entire backing buffer of a TypedData view (not just the windowed
+    // range) — so capturing a view in the closure would serialize the
+    // whole image to every band isolate. Copying here first means each
+    // isolate receives only its own band.
+    final bandBytes =
+        Uint8List.fromList(Uint8List.sublistView(rgba, startByte, endByte));
+    // Guard against a future regression reintroducing a shared-buffer view:
+    // bandBytes must own a buffer sized to exactly this band, not the full
+    // image.
+    assert(bandBytes.buffer.lengthInBytes == bandBytes.lengthInBytes);
+    assert(!identical(bandBytes.buffer, rgba.buffer));
     jobs.add(Isolate.run(() => _gradeBandSync(_BandJob(
-          rgba: Uint8List.fromList(bandBytes),
+          rgba: bandBytes,
           lattice: lattice,
           lutSize: lutSize,
           domainMin: domainMin,

@@ -113,7 +113,11 @@ class _PhotoScreenState extends State<PhotoScreen> {
         // real problem.
       }
     }
-    _previewGrading = false;
+    if (!mounted) {
+      _previewGrading = false;
+      return;
+    }
+    setState(() => _previewGrading = false);
   }
 
   Future<void> _save() async {
