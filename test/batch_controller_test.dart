@@ -1,11 +1,19 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:image_picker/image_picker.dart';
 
 import 'package:alexa_look/core/cancellation.dart';
+import 'package:alexa_look/core/media_detector.dart';
 import 'package:alexa_look/features/batch/batch_controller.dart';
 import 'package:alexa_look/features/batch/batch_models.dart';
 
-BatchItem _item(String path) => BatchItem.fromFile(XFile(path), id: path);
+/// These tests are about BatchController's state machine, not
+/// media_detector's content sniffing, so [type] just defaults from the
+/// path's extension by the old familiar convention rather than actually
+/// sniffing bytes.
+BatchItem _item(String path, {BatchMediaType? type}) => BatchItem(
+      id: path,
+      path: path,
+      type: type ?? (path.endsWith('.mp4') ? MediaCategory.video : MediaCategory.photo),
+    );
 
 /// A fake stand-in for [VideoGradeCancelledException] (video_processor.dart
 /// isn't imported here to keep this a pure BatchController unit test) —
@@ -30,6 +38,7 @@ void main() {
           onProgress(0.5);
           onProgress(1.0);
         },
+        processRaw: (item, intensity, onProgress) async {},
         processVideo: (item, intensity, onProgress) async {},
       );
       controller.addListener(() {
@@ -65,6 +74,7 @@ void main() {
           }
           onProgress(1.0);
         },
+        processRaw: (item, intensity, onProgress) async {},
         processVideo: (item, intensity, onProgress) async {},
       );
 
@@ -86,6 +96,7 @@ void main() {
       final controller = BatchController(
         items: items,
         processPhoto: (item, intensity, onProgress) async => calledPhoto.add(item.id),
+        processRaw: (item, intensity, onProgress) async {},
         processVideo: (item, intensity, onProgress) async => calledVideo.add(item.id),
       );
 
@@ -109,6 +120,7 @@ void main() {
             controller.cancel();
           }
         },
+        processRaw: (item, intensity, onProgress) async {},
         processVideo: (item, intensity, onProgress) async {},
       );
 
@@ -135,6 +147,7 @@ void main() {
       final controller = BatchController(
         items: items,
         processPhoto: (item, intensity, onProgress) async => onProgress(1.0),
+        processRaw: (item, intensity, onProgress) async {},
         processVideo: (item, intensity, onProgress) async {
           if (item.id == 'a.mp4') {
             throw const _FakeCancelledException();
@@ -166,6 +179,7 @@ void main() {
       controller = BatchController(
         items: items,
         processPhoto: (item, intensity, onProgress) async {},
+        processRaw: (item, intensity, onProgress) async {},
         processVideo: (item, intensity, onProgress) async {
           started.add(item.id);
           // Simulate BatchScreen.dispose(): the widget is torn down mid
@@ -196,6 +210,7 @@ void main() {
           startedCount++;
           await Future<void>.delayed(const Duration(milliseconds: 10));
         },
+        processRaw: (item, intensity, onProgress) async {},
         processVideo: (item, intensity, onProgress) async {},
       );
 
@@ -205,6 +220,30 @@ void main() {
 
       expect(startedCount, 1);
       expect(items[0].status, BatchItemStatus.done);
+    });
+
+    test('routes a RAW item through processRaw, not processPhoto/processVideo', () async {
+      final calledPhoto = <String>[];
+      final calledRaw = <String>[];
+      final calledVideo = <String>[];
+      final items = [
+        _item('a.jpg'),
+        _item('b.dng', type: MediaCategory.raw),
+        _item('c.mp4'),
+      ];
+      final controller = BatchController(
+        items: items,
+        processPhoto: (item, intensity, onProgress) async => calledPhoto.add(item.id),
+        processRaw: (item, intensity, onProgress) async => calledRaw.add(item.id),
+        processVideo: (item, intensity, onProgress) async => calledVideo.add(item.id),
+      );
+
+      await controller.run(1.0);
+
+      expect(calledPhoto, ['a.jpg']);
+      expect(calledRaw, ['b.dng']);
+      expect(calledVideo, ['c.mp4']);
+      expect(items.every((i) => i.status == BatchItemStatus.done), isTrue);
     });
   });
 }

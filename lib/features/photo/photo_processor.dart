@@ -259,17 +259,29 @@ class RawPrepareRequest {
   /// Number of channels in [rgbBytes] — 3 (RGB) for a fresh LibRaw/ffmpeg
   /// decode, 4 (RGBA) if the caller already normalized it.
   final int numChannels;
-  final String cubeText;
+  final String? cubeText;
+  final PreparedLut? preparedLut;
   final bool buildPreview;
 
+  /// Exactly one of [cubeText] or [preparedLut] must be supplied — same
+  /// contract as [PhotoPrepareRequest]. Passing [cubeText] parses it fresh,
+  /// inside the prepare isolate: fine for the single-photo editor's one-shot
+  /// RAW import. A caller preparing many RAW items against the same look
+  /// (the batch flow) should parse once via [PreparedLut.parse] and pass
+  /// [preparedLut] instead, so the same lattice is reused rather than
+  /// re-parsed per item.
   const RawPrepareRequest({
     required this.rgbBytes,
     required this.width,
     required this.height,
-    required this.cubeText,
+    this.cubeText,
+    this.preparedLut,
     this.numChannels = 3,
     this.buildPreview = true,
-  });
+  }) : assert(
+          (cubeText == null) != (preparedLut == null),
+          'Provide exactly one of cubeText or preparedLut.',
+        );
 }
 
 /// Like [preparePhoto], but for a RAW photo that's already been decoded to
@@ -293,7 +305,7 @@ Future<PreparedPhoto> preparePhotoFromRgba(RawPrepareRequest request) {
           ? img.ChannelOrder.rgba
           : img.ChannelOrder.rgb,
     );
-    final lut = PreparedLut.parse(request.cubeText);
+    final lut = request.preparedLut ?? PreparedLut.parse(request.cubeText!);
     return _prepareFromImage(image, lut, request.buildPreview);
   });
 }
