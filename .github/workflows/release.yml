@@ -3,6 +3,12 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0) — created at the built commit if it does not exist'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -33,11 +39,16 @@ jobs:
       - name: Build APK
         run: flutter build apk --release
 
+      - name: Determine release tag
+        id: tag
+        run: echo "tag=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
       - name: Rename APK
-        run: cp build/app/outputs/flutter-apk/app-release.apk alexa-look-${{ github.ref_name }}.apk
+        run: cp build/app/outputs/flutter-apk/app-release.apk alexa-look-${{ steps.tag.outputs.tag }}.apk
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: alexa-look-${{ github.ref_name }}.apk
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: alexa-look-${{ steps.tag.outputs.tag }}.apk
           generate_release_notes: true
