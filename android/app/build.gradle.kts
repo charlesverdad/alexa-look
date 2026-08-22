@@ -28,6 +28,30 @@ android {
         // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+
+        // ABIs we ship libcamraw.so (RAW/DNG decoding, see native/) for.
+        // Covers essentially all real Android devices; excludes the rarely
+        // used 32-bit x86 and armeabi.
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+        }
+    }
+
+    // Builds native/CMakeLists.txt (vendored LibRaw + the camraw wrapper)
+    // into libcamraw.so, loaded at runtime via dart:ffi from
+    // lib/core/raw_decoder.dart. See native/libraw/VENDORING.md.
+    //
+    // Deliberately not pinning externalNativeBuild.cmake.version here: AGP
+    // auto-selects whichever CMake package already installed in the SDK
+    // satisfies native/CMakeLists.txt's `cmake_minimum_required` (3.18), so
+    // this doesn't depend on exactly which CMake versions a given CI
+    // runner image happens to bundle (subject to drift over time) and
+    // avoids triggering an SDK-manager download for a specific version
+    // that may not be present.
+    externalNativeBuild {
+        cmake {
+            path = file("../../native/CMakeLists.txt")
+        }
     }
 
     buildTypes {
